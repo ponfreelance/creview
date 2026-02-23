@@ -1,0 +1,82 @@
+============================================
+CReview ビルド手順（全プラットフォーム）
+============================================
+
+■ 前提
+--------------------------------------------
+
+  Python 3.8以上
+  pip install pyinstaller
+
+
+■ Windows
+--------------------------------------------
+
+  build.bat をダブルクリック
+
+  出力: creview_win.zip
+  中身:
+    creview.exe
+    config.txt.sample
+    manual.txt
+    start.bat
+    start_spec.bat
+    sha256.txt
+
+
+■ Mac
+--------------------------------------------
+
+  chmod +x build.sh
+  ./build.sh
+
+  出力: creview_mac.tar.gz
+  中身:
+    creview
+    config.txt.sample
+    manual.txt
+    sha256.txt
+
+
+■ Linux
+--------------------------------------------
+
+  chmod +x build.sh
+  ./build.sh
+
+  出力: creview_linux.tar.gz
+  中身:
+    creview
+    config.txt.sample
+    manual.txt
+    sha256.txt
+
+
+■ GitHub Releaseの推奨構成
+--------------------------------------------
+
+  v0.3.0
+  ├── creview_win.zip
+  ├── creview_mac.tar.gz
+  ├── creview_linux.tar.gz
+  └── RELEASE_NOTES.md
+
+
+■ 注意事項
+--------------------------------------------
+
+  - 各OSでビルドする必要がある
+    （Windows版はWindowsで、Mac版はMacで）
+  - GitHub Actionsで自動化可能（後述）
+  - Mac版は署名なしだと Gatekeeper で警告が出る
+    → ユーザーに以下を案内:
+    chmod +x creview
+    xattr -d com.apple.quarantine creview
+
+
+■ GitHub Actions自動ビルド（将来用）
+--------------------------------------------
+
+  .github/workflows/release.yml で
+  3OS同時ビルドが可能。
+  必要になったら追加してください。

@@ -1,0 +1,11 @@
+config.txt
+__pycache__/
+*.pyc
+dist/
+build/
+*.spec
+release/
+*.zip
+*.tar.gz
+.creviewignore
+test_sample.c

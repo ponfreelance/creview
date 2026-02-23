@@ -1,0 +1,26 @@
+# ============================================
+# CReview CLI 設定ファイル
+# ============================================
+#
+# 使い方:
+#   1. このファイルを config.txt にリネーム
+#   2. API_KEY にClaudeのAPIキーを入力
+#   3. 保存して完了
+#
+# APIキー取得先: https://console.anthropic.com/
+#
+
+# Claude APIキーを入力（必須）
+API_KEY=ここにAPIキー
+
+# 使用モデル（基本変更不要）
+MODEL=claude-sonnet-4-20250514
+
+# API応答待機秒（基本変更不要）
+TIMEOUT=60
+
+# 大きいファイル分割サイズ（基本変更不要）
+MAX_CHUNK_LINES=800
+
+# デバッグ表示（通常false）
+DEBUG=false

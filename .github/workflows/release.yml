@@ -1,0 +1,92 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: creview_win
+            ext: .zip
+          - os: macos-latest
+            artifact: creview_mac
+            ext: .tar.gz
+          - os: ubuntu-latest
+            artifact: creview_linux
+            ext: .tar.gz
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install PyInstaller
+        run: pip install pyinstaller
+
+      - name: Build binary
+        run: pyinstaller --onefile --name creview creview.py
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path release -Force
+          Copy-Item dist/creview.exe release/
+          Copy-Item config.txt.sample release/
+          Copy-Item manual.txt release/
+          Copy-Item start.bat release/
+          Copy-Item start_spec.bat release/
+          certutil -hashfile release/creview.exe SHA256 > release/sha256.txt
+          Compress-Archive -Path release/* -DestinationPath creview_win.zip
+
+      - name: Package (Mac/Linux)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p release
+          cp dist/creview release/
+          cp config.txt.sample release/
+          cp manual.txt release/
+          chmod +x release/creview
+          if command -v sha256sum &>/dev/null; then
+            sha256sum release/creview > release/sha256.txt
+          else
+            shasum -a 256 release/creview > release/sha256.txt
+          fi
+          OSNAME=$(echo "${{ matrix.artifact }}" | cut -d_ -f2)
+          tar -czf "creview_${OSNAME}.tar.gz" -C release .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            creview_win.zip
+            creview_*.tar.gz
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            creview_win.zip
+            creview_mac.tar.gz
+            creview_linux.tar.gz
