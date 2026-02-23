@@ -113,6 +113,17 @@ chmod +x build.sh
 
 GitHub Actionsによる3OS同時ビルドにも対応（`.github/workflows/release.yml`）。
 
+## カスタム対応
+
+社内コーディング規約に合わせたレビュールールの追加・調整を承ります。
+
+- 自社コーディング規約に基づく検出ルール追加
+- MISRA-C / CERT-C 等の規格対応
+- 既存CI/CDパイプラインへの組み込み支援
+- レビュープロンプトの調整
+
+お問い合わせ: [X (@pon_freelance)](https://x.com/pon_freelance) / nqg14616@nifty.com
+
 ## ライセンス
 
 MIT
