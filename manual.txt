@@ -46,7 +46,7 @@ C設計レビューAI  CReview v0.4.0
   creview --local-only main.c
 
 APIキー無しでも使えます。
-ローカル静的解析12パターンのみ実行。
+ローカル静的解析14パターンのみ実行。
 
 
 ■ JSON出力
@@ -76,8 +76,8 @@ APIキー無しでも使えます。
   GLOBAL_OK      グローバル変数警告を抑制
   MACRO_ALLOW    マクロ警告を抑制
   MAGIC_OK       マジックナンバー警告を抑制
-  VOLATILE_OK    volatile関連を抑制（将来用）
-  PACKED_OK      packed struct関連を抑制（将来用）
+  VOLATILE_OK    volatile変数の非アトミック操作警告を抑制
+  PACKED_OK      packed構造体警告を抑制
 
   # 以降はコメント
 

@@ -566,6 +566,88 @@ def check_magic_numbers(fp, raw, cl, issues, ignore):
                         break
 
 
+def check_volatile(fp, raw, cl, issues, ignore):
+    """volatile変数の非アトミック複合操作検出"""
+    if ignore.volatile_ok:
+        return
+    volatile_vars: Set[str] = set()
+    vol_re = re.compile(
+        r'\bvolatile\s+(?:unsigned\s+|signed\s+)?'
+        r'(?:int|char|short|long|float|double|uint\w+|int\w+|size_t|_Bool|bool)\s+'
+        r'(\w+)')
+    vol_re2 = re.compile(
+        r'(?:unsigned\s+|signed\s+)?'
+        r'(?:int|char|short|long|float|double|uint\w+|int\w+|size_t|_Bool|bool)\s+'
+        r'volatile\s+(\w+)')
+    for line in cl:
+        for m in vol_re.finditer(line):
+            volatile_vars.add(m.group(1))
+        for m in vol_re2.finditer(line):
+            volatile_vars.add(m.group(1))
+    if not volatile_vars:
+        return
+    for i, line in enumerate(cl):
+        for var in volatile_vars:
+            if re.search(rf'\b{re.escape(var)}\s*\+\+', line) or \
+               re.search(rf'\+\+\s*{re.escape(var)}\b', line) or \
+               re.search(rf'\b{re.escape(var)}\s*--', line) or \
+               re.search(rf'--\s*{re.escape(var)}\b', line):
+                issues.append(Issue(Severity.DESIGN, fp, i + 1,
+                    f"volatile変数{var}に++/--使用。read-modify-writeは非アトミック、割り込み競合の危険"))
+            elif re.search(rf'\b{re.escape(var)}\s*(?:[+\-*/%&|^]|<<|>>)=', line):
+                issues.append(Issue(Severity.DESIGN, fp, i + 1,
+                    f"volatile変数{var}に複合代入使用。read-modify-writeは非アトミック、割り込み競合の危険"))
+
+
+def check_packed(fp, raw, cl, issues, ignore):
+    """packed構造体の危険パターン検出"""
+    if ignore.packed_ok:
+        return
+    # #pragma packスコープ追跡
+    pack_depth = 0
+    pack_lines = []
+    in_pack = [False] * len(raw)
+    for i, rl in enumerate(raw):
+        stripped = rl.strip()
+        if re.search(r'#\s*pragma\s+pack\s*\(\s*push', stripped):
+            pack_depth += 1
+            pack_lines.append(i + 1)
+        elif re.search(r'#\s*pragma\s+pack\s*\(\s*pop', stripped) or \
+             re.search(r'#\s*pragma\s+pack\s*\(\s*\)', stripped):
+            if pack_depth > 0:
+                pack_depth -= 1
+                pack_lines.pop()
+        in_pack[i] = pack_depth > 0
+    for ln in pack_lines:
+        issues.append(Issue(Severity.DESIGN, fp, ln,
+            "#pragma pack(push)に対応するpack(pop)なし。後続構造体のアラインメントに影響波及"))
+    # packed構造体のポインタメンバ検出
+    packed_re = re.compile(r'__attribute__\s*\(\s*\(\s*packed\s*\)\s*\)')
+    i = 0
+    while i < len(cl):
+        line = cl[i]
+        if not re.search(r'\bstruct\b', line) or '{' not in line:
+            i += 1
+            continue
+        struct_start = i
+        brace = 0
+        has_ptr = False
+        is_packed = bool(packed_re.search(line)) or in_pack[i]
+        for j in range(i, len(cl)):
+            brace += cl[j].count('{') - cl[j].count('}')
+            if j > i and re.search(r'\w+\s*\*\s*\w+\s*;', cl[j]):
+                has_ptr = True
+            if brace <= 0 and j > i:
+                if packed_re.search(cl[j]):
+                    is_packed = True
+                if is_packed and has_ptr:
+                    issues.append(Issue(Severity.DESIGN, fp, struct_start + 1,
+                        "packed構造体にポインタメンバ。アラインメント違反で一部アーキテクチャでクラッシュ"))
+                i = j
+                break
+        i += 1
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Phase 1: ローカル静的解析エンジン
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -594,6 +676,8 @@ def run_local_analysis(filepath: str, ignore: IgnoreConfig) -> List[Issue]:
     check_sizeof_pointer(filepath, raw, cl, issues)
     check_fd_leak(filepath, raw, cl, issues)
     check_magic_numbers(filepath, raw, cl, issues, ignore)
+    check_volatile(filepath, raw, cl, issues, ignore)
+    check_packed(filepath, raw, cl, issues, ignore)
 
     issues.sort(key=lambda x: x.line)
     return issues
