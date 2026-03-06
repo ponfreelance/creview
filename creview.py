@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-creview v0.4.0 - C言語設計レビュー専用CLI
+creview v0.5.0 - C言語設計レビュー専用CLI
 指摘専用。コード生成・修正案・改善案 一切なし。
 ローカル静的解析 + Claude API深層レビュー 二段構成。
 """
@@ -18,7 +18,7 @@ from typing import List, Dict, Set, Optional, Tuple
 from pathlib import Path
 
 # ─── バージョン / 定数 ────────────────────────────────
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 IGNOREFILE = ".creviewignore"
 CONFIGFILE = "config.txt"
 MAX_CHUNK_BYTES = 80_000
