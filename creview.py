@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-creview v0.8.0 - C言語設計レビュー専用CLI
+creview v0.14.0 - C言語設計レビュー専用CLI
 指摘専用。コード生成・修正案・改善案 一切なし。
 ローカル静的解析 + Claude API深層レビュー 二段構成。
 """
@@ -20,7 +20,7 @@ from fnmatch import fnmatch
 import subprocess
 
 # ─── バージョン / 定数 ────────────────────────────────
-VERSION = "0.13.0"
+VERSION = "0.14.0"
 IGNOREFILE = ".creviewignore"
 CONFIGFILE = "config.txt"
 MAX_CHUNK_BYTES = 80_000

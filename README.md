@@ -57,7 +57,7 @@ xattr -d com.apple.quarantine creview
 ### ① コードレビュー
 
 `.c` / `.h` ファイルを解析し、実装上の危険箇所を検出。
-ローカル静的解析（33パターン）＋ Claude API深層レビューの二段構成。
+ローカル静的解析（36パターン）＋ Claude API深層レビューの二段構成。
 
 `--local-only` ならAPIキー不要。ローカル解析のみで動作します。
 
