@@ -1205,7 +1205,7 @@ class TestBufReport(unittest.TestCase):
 
 
 class TestTinyFunction(unittest.TestCase):
-    """check_tiny_function: コンパイル後オブジェクトサイズ5バイト以下検出"""
+    """check_tiny_function: コンパイル後オブジェクトサイズ8バイト以下検出"""
 
     def _run_tiny_check(self, src):
         """tiny_functionルールのみで解析"""

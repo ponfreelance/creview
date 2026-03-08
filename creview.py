@@ -1213,8 +1213,11 @@ def _get_obj_func_sizes(filepath: str) -> Optional[Dict[str, int]]:
         os.close(obj_fd)
         obj_fd = None
         # -c: コンパイルのみ, -w: 警告抑制, -O2: 最適化で実質コードサイズを測定
+        # -fomit-frame-pointer: フレームポインタ省略でABI差を最小化
+        # -fno-asynchronous-unwind-tables: .eh_frame除外でサイズ計測精度向上
         result = subprocess.run(
-            [gcc, "-c", "-w", "-O2", "-o", obj_path, filepath],
+            [gcc, "-c", "-w", "-O2", "-fomit-frame-pointer",
+             "-fno-asynchronous-unwind-tables", "-o", obj_path, filepath],
             capture_output=True, timeout=30)
         if result.returncode != 0:
             return None
@@ -1323,8 +1326,9 @@ def _get_obj_func_sizes(filepath: str) -> Optional[Dict[str, int]]:
 
 
 def check_tiny_function(fp, raw, cl, issues):
-    """コンパイル後のオブジェクトサイズが5バイト未満の関数を検出。
+    """コンパイル後のオブジェクトサイズが極小の関数を検出。
     スタブ・空関数・リンク事故の疑い。gcc未使用環境ではソース解析にフォールバック"""
+    TINY_THRESHOLD = 8  # バイト(x86/ARM共通で空関数を捕捉)
     # ソース行から関数定義の行番号マップを作成
     func_re = re.compile(r'^(\w[\w\s\*]*?)\s+(\w+)\s*\(')
     func_lines: Dict[str, int] = {}
@@ -1339,10 +1343,10 @@ def check_tiny_function(fp, raw, cl, issues):
     obj_sizes = _get_obj_func_sizes(fp)
     if obj_sizes is not None:
         for fname, size in obj_sizes.items():
-            if size <= 5:
+            if size <= TINY_THRESHOLD:
                 line = func_lines.get(fname, 0)
                 issues.append(Issue(Severity.MAINT, fp, line,
-                    f"関数{fname}: オブジェクトサイズ{size}バイト(5バイト以下)。"
+                    f"関数{fname}: オブジェクトサイズ{size}バイト({TINY_THRESHOLD}バイト以下)。"
                     f"スタブまたは空関数の疑い"))
         return
 
