@@ -55,7 +55,7 @@ CReview ビルド手順（全プラットフォーム）
 ■ GitHub Releaseの推奨構成
 --------------------------------------------
 
-  v0.3.0
+  v0.13.0
   ├── creview_win.zip
   ├── creview_mac.tar.gz
   ├── creview_linux.tar.gz
