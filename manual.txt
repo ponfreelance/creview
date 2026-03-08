@@ -1,5 +1,5 @@
 ============================================
-C設計レビューAI  CReview v0.6.0
+C設計レビューAI  CReview v0.7.0
 ============================================
 
 
@@ -46,7 +46,7 @@ C設計レビューAI  CReview v0.6.0
   creview --local-only main.c
 
 APIキー無しでも使えます。
-ローカル静的解析21パターンのみ実行。
+ローカル静的解析27パターンのみ実行。
 
 
 ■ 差分モード（変更行のみレビュー）
@@ -58,12 +58,34 @@ git diffの変更行に該当する指摘のみ出力。
 PR前の差分チェックに最適。
 
 
+■ 重大度フィルタ
+--------------------------------------------
+
+  creview --local-only --severity critical src/
+
+critical / design / maint から選択。
+指定した重大度の指摘のみ表示。
+
+
+■ 集計モード
+--------------------------------------------
+
+  creview --local-only --count src/
+
+ファイルごとの重大度別件数と合計を表示。
+出力例:
+  main.c: 重大=3 設計不明=1 保守危険=2
+  util.c: 重大=0 設計不明=2 保守危険=1
+  合計: 重大=3 設計不明=3 保守危険=3
+
+
 ■ 出力形式
 --------------------------------------------
 
-  creview --format text main.c     テキスト（デフォルト）
-  creview --format json main.c     JSON
-  creview --format markdown main.c Markdown（レポート向け）
+  creview --format text main.c      テキスト（デフォルト）
+  creview --format json main.c      JSON
+  creview --format markdown main.c  Markdown（レポート向け）
+  creview --format sarif main.c     SARIF 2.1.0（GitHub Code Scanning連携）
 
 
 ■ 出力の見方
@@ -79,7 +101,7 @@ PR前の差分チェックに最適。
   将来バグ化可能。
 
 
-■ ローカル静的解析パターン一覧（21種）
+■ ローカル静的解析パターン一覧（27種）
 --------------------------------------------
 
   [重大]
@@ -95,19 +117,25 @@ PR前の差分チェックに最適。
   10. 未初期化変数使用
   11. 整数オーバーフロー (malloc乗算)
   12. open/socket/pipe リソースリーク
+  13. 固定バッファオーバーラン (strncpy/memcpyサイズ超過)
+  14. pthread_mutex_lock/unlock不整合 (デッドロック)
 
   [設計不明]
-  13. return値と空returnの混在
-  14. switch case fall-through
-  15. マクロ引数の括弧未保護
-  16. volatile変数の非アトミック操作
-  17. packed構造体のアラインメント問題
-  18. signed/unsigned混合比較
+  15. return値と空returnの混在
+  16. switch case fall-through
+  17. マクロ引数の括弧未保護
+  18. volatile変数の非アトミック操作
+  19. packed構造体のアラインメント問題
+  20. signed/unsigned混合比較
+  21. NULLチェック分岐後のポインタ使用
+  22. 無限ループ (break/returnなし)
+  23. enum型switchでdefaultなし
 
   [保守危険]
-  19. グローバル変数の関数内直接更新
-  20. マジックナンバー
-  21. snprintf戻り値無視
+  24. グローバル変数の関数内直接更新
+  25. マジックナンバー
+  26. snprintf戻り値無視
+  27. 深さ制限なし自己再帰
 
 
 ■ 警告抑制 .creviewignore
@@ -136,6 +164,27 @@ PR前の差分チェックに最適。
 ファイル名またはパスのglob一致で除外。
 
 
+■ 個別ルール無効化 (RULE_OFF)
+--------------------------------------------
+
+.creviewignore にルール名を記述して無効化：
+
+  RULE_OFF format_string
+  RULE_OFF magic_numbers
+  RULE_OFF snprintf_retval
+
+利用可能なルール名：
+  null_deref, unsafe_funcs, memcpy_no_null,
+  array_index, double_free, return_inconsistency,
+  globals, macros, switch_fallthrough, sizeof_pointer,
+  fd_leak, magic_numbers, volatile, packed,
+  format_string, use_after_free, uninitialized,
+  sign_compare, integer_overflow, resource_leak,
+  snprintf_retval, buffer_overrun, null_deref_branch,
+  infinite_loop, enum_switch, recursive_no_limit,
+  mutex_unlock
+
+
 ■ 行単位の抑制 (NOCHECK)
 --------------------------------------------
 
@@ -162,6 +211,7 @@ PR前の差分チェックに最適。
 1. 実装前    creview --spec spec.txt
 2. 実装後    creview src/
 3. PR前      creview --diff --local-only src/
+4. CI        creview --format sarif --local-only src/ > results.sarif
 
 
 ■ 終了コード

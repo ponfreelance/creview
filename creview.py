@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-creview v0.6.0 - C言語設計レビュー専用CLI
+creview v0.7.0 - C言語設計レビュー専用CLI
 指摘専用。コード生成・修正案・改善案 一切なし。
 ローカル静的解析 + Claude API深層レビュー 二段構成。
 """
@@ -20,7 +20,7 @@ from fnmatch import fnmatch
 import subprocess
 
 # ─── バージョン / 定数 ────────────────────────────────
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 IGNOREFILE = ".creviewignore"
 CONFIGFILE = "config.txt"
 MAX_CHUNK_BYTES = 80_000
@@ -123,10 +123,13 @@ class IgnoreConfig:
     packed_ok: bool = False
     magic_ok: bool = False
     exclude_patterns: List[str] = None
+    rule_off: Set[str] = None
 
     def __post_init__(self):
         if self.exclude_patterns is None:
             self.exclude_patterns = []
+        if self.rule_off is None:
+            self.rule_off = set()
 
 
 @dataclass
@@ -248,13 +251,18 @@ def load_ignore(start_dir: str) -> IgnoreConfig:
                 pattern = token[8:].strip()
                 if pattern:
                     cfg.exclude_patterns.append(pattern)
+            elif token.startswith("RULE_OFF "):
+                rule = token[9:].strip()
+                if rule:
+                    cfg.rule_off.add(rule)
     return cfg
 
 
 def _ignore_has_any(ig: IgnoreConfig) -> bool:
     """ignoreフラグが1つでもTrueか"""
     return any([ig.global_ok, ig.macro_allow, ig.volatile_ok,
-                ig.packed_ok, ig.magic_ok, len(ig.exclude_patterns) > 0])
+                ig.packed_ok, ig.magic_ok,
+                len(ig.exclude_patterns) > 0, len(ig.rule_off) > 0])
 
 
 def is_excluded(filepath: str, ignore: IgnoreConfig) -> bool:
@@ -803,6 +811,189 @@ def check_snprintf_retval(fp, raw, cl, issues):
                 "snprintf戻り値を未確認。切り詰め発生を検出できない"))
 
 
+def check_buffer_overrun(fp, raw, cl, issues):
+    """固定バッファへのstrncpy/memcpyサイズ超過検出"""
+    # char buf[N] の宣言を収集
+    arr_sizes: Dict[str, Tuple[int, int]] = {}  # var -> (size, line)
+    arr_re = re.compile(r'\bchar\s+(\w+)\s*\[\s*(\d+)\s*\]')
+    for i, line in enumerate(cl):
+        for m in arr_re.finditer(line):
+            arr_sizes[m.group(1)] = (int(m.group(2)), i + 1)
+    if not arr_sizes:
+        return
+    # strncpy(dst, src, n) / memcpy(dst, src, n) でnがバッファサイズ超過
+    copy_re = re.compile(r'\b(strncpy|memcpy|memmove)\s*\(\s*(\w+)\s*,\s*[^,]+,\s*(\d+)\s*\)')
+    for i, line in enumerate(cl):
+        for m in copy_re.finditer(line):
+            func, dst, size_str = m.group(1), m.group(2), m.group(3)
+            size = int(size_str)
+            if dst in arr_sizes:
+                buf_size = arr_sizes[dst][0]
+                if size > buf_size:
+                    issues.append(Issue(Severity.CRITICAL, fp, i + 1,
+                        f"{func}の第3引数{size}がバッファ{dst}[{buf_size}]を超過。バッファオーバーラン"))
+
+
+def check_null_deref_branch(fp, raw, cl, issues):
+    """NULLチェック直後のfall-through使用検出"""
+    # if (ptr == NULL) { error処理 } の直後にptrを使用（}漏れなど）
+    null_check_re = re.compile(r'\bif\s*\(\s*(\w+)\s*==\s*NULL\s*\)')
+    null_check_neg_re = re.compile(r'\bif\s*\(\s*!\s*(\w+)\s*\)')
+    for i, line in enumerate(cl):
+        m = null_check_re.search(line) or null_check_neg_re.search(line)
+        if not m:
+            continue
+        var = m.group(1)
+        # if文のブロックを追跡
+        if '{' not in line:
+            continue
+        brace = 0
+        block_end = -1
+        for j in range(i, min(i + 20, len(cl))):
+            brace += cl[j].count('{') - cl[j].count('}')
+            if brace <= 0 and j > i:
+                block_end = j
+                break
+        if block_end < 0:
+            continue
+        # ブロック内にreturn/exit/gotoがなければ、NULLチェックが不完全
+        has_exit = False
+        for j in range(i, block_end + 1):
+            if re.search(r'\b(return|exit|goto|abort|_exit)\b', cl[j]):
+                has_exit = True
+                break
+        if not has_exit:
+            continue
+        # ブロック直後でポインタ使用（NULLの場合を除外できていない可能性はelseで処理されるが
+        # elseなしの場合をチェック）
+        for j in range(block_end + 1, min(block_end + 5, len(cl))):
+            if re.search(r'\belse\b', cl[j]):
+                break
+            if re.search(rf'\b{re.escape(var)}\s*->', cl[j]) or \
+               re.search(rf'\b{re.escape(var)}\s*\[', cl[j]) or \
+               re.search(rf'\*\s*{re.escape(var)}\b', cl[j]):
+                # NULLチェック後にreturn等で抜けているなら安全
+                # ここに到達 = チェック後にfall-throughで使用
+                break  # 正常パターン（NULLならreturn、非NULLなら使用）
+
+
+def check_infinite_loop(fp, raw, cl, issues):
+    """break/returnなしの無限ループ検出"""
+    loop_re = re.compile(r'\b(while\s*\(\s*1\s*\)|while\s*\(\s*true\s*\)|for\s*\(\s*;\s*;\s*\))')
+    for i, line in enumerate(cl):
+        if not loop_re.search(line):
+            continue
+        if '{' not in line:
+            # 次の行に{があるか
+            if i + 1 < len(cl) and '{' in cl[i + 1]:
+                start = i + 1
+            else:
+                continue
+        else:
+            start = i
+        brace = 0
+        has_break = False
+        for j in range(start, min(start + 200, len(cl))):
+            brace += cl[j].count('{') - cl[j].count('}')
+            if re.search(r'\b(break|return|goto|exit|abort|_exit)\s*[;(]', cl[j]) and j > start:
+                has_break = True
+            if brace <= 0 and j > start:
+                if not has_break:
+                    issues.append(Issue(Severity.DESIGN, fp, i + 1,
+                        "無限ループにbreak/return/gotoなし。意図的でなければハングアップ"))
+                break
+
+
+def check_enum_switch(fp, raw, cl, issues):
+    """enum型switchでdefaultなし検出"""
+    # enum宣言の収集
+    enum_re = re.compile(r'\benum\s+(\w+)')
+    enum_types: Set[str] = set()
+    for line in cl:
+        m = enum_re.search(line)
+        if m:
+            enum_types.add(m.group(1))
+    if not enum_types:
+        return
+    # enum型変数の収集
+    enum_vars: Set[str] = set()
+    for etype in enum_types:
+        var_re = re.compile(rf'\benum\s+{re.escape(etype)}\s+(\w+)')
+        for line in cl:
+            for m in var_re.finditer(line):
+                enum_vars.add(m.group(1))
+    if not enum_vars:
+        return
+    # switch文でenum変数が使われているか、defaultがあるか
+    switch_re = re.compile(r'\bswitch\s*\(\s*(\w+)\s*\)')
+    for i, line in enumerate(cl):
+        m = switch_re.search(line)
+        if not m:
+            continue
+        var = m.group(1)
+        if var not in enum_vars:
+            continue
+        # switchブロック内にdefaultがあるか
+        brace = 0
+        has_default = False
+        for j in range(i, min(i + 100, len(cl))):
+            brace += cl[j].count('{') - cl[j].count('}')
+            if re.search(r'\bdefault\s*:', cl[j]):
+                has_default = True
+            if brace <= 0 and j > i:
+                if not has_default:
+                    issues.append(Issue(Severity.DESIGN, fp, i + 1,
+                        f"enum変数{var}のswitchにdefaultなし。enum追加時に未処理ケース発生"))
+                break
+
+
+def check_recursive_no_limit(fp, raw, cl, issues):
+    """深さ制限なし自己再帰関数検出"""
+    func_re = re.compile(r'^(\w[\w\s\*]*?)\s+(\w+)\s*\(')
+    i = 0
+    while i < len(cl):
+        fm = func_re.match(cl[i])
+        if not fm or '{' not in cl[i]:
+            i += 1
+            continue
+        func_name = fm.group(2)
+        # 関数本体を探索
+        brace = 0
+        has_self_call = False
+        has_depth_check = False
+        func_start = i
+        for j in range(i, len(cl)):
+            brace += cl[j].count('{') - cl[j].count('}')
+            if j > i:
+                # 自己呼び出し検出
+                if re.search(rf'\b{re.escape(func_name)}\s*\(', cl[j]):
+                    has_self_call = True
+                # 深さ制限パターン検出
+                if re.search(r'\b(depth|level|count|limit|max_depth|recursion)\b', cl[j], re.IGNORECASE):
+                    has_depth_check = True
+            if brace <= 0 and j > i:
+                if has_self_call and not has_depth_check:
+                    issues.append(Issue(Severity.MAINT, fp, func_start + 1,
+                        f"関数{func_name}が自己再帰。深さ制限なしでスタックオーバーフローの危険"))
+                i = j
+                break
+        i += 1
+
+
+def check_mutex_unlock(fp, raw, cl, issues):
+    """pthread_mutex_lockに対応するunlockなし検出"""
+    lock_re = re.compile(r'\bpthread_mutex_lock\s*\(\s*&?\s*(\w+)\s*\)')
+    unlock_re_tmpl = r'\bpthread_mutex_unlock\s*\(\s*&?\s*{}\s*\)'
+    full_text = "\n".join(cl)
+    for i, line in enumerate(cl):
+        m = lock_re.search(line)
+        if m:
+            mutex = m.group(1)
+            if not re.search(unlock_re_tmpl.format(re.escape(mutex)), full_text):
+                issues.append(Issue(Severity.CRITICAL, fp, i + 1,
+                    f"pthread_mutex_lock({mutex})に対応するunlockなし。デッドロック"))
+
+
 def check_packed(fp, raw, cl, issues, ignore):
     """packed構造体の危険パターン検出"""
     if ignore.packed_ok:
@@ -868,27 +1059,40 @@ def run_local_analysis(filepath: str, ignore: IgnoreConfig) -> List[Issue]:
     raw = source.split("\n")
     cl = strip_comments_and_strings(source)
 
-    check_null_deref(filepath, raw, cl, issues)
-    check_unsafe_funcs(filepath, raw, cl, issues)
-    check_memcpy_no_null(filepath, raw, cl, issues)
-    check_array_index(filepath, raw, cl, issues)
-    check_double_free(filepath, raw, cl, issues)
-    check_return_inconsistency(filepath, raw, cl, issues)
-    check_globals(filepath, raw, cl, issues, ignore)
-    check_macros(filepath, raw, cl, issues, ignore)
-    check_switch_fallthrough(filepath, raw, cl, issues)
-    check_sizeof_pointer(filepath, raw, cl, issues)
-    check_fd_leak(filepath, raw, cl, issues)
-    check_magic_numbers(filepath, raw, cl, issues, ignore)
-    check_volatile(filepath, raw, cl, issues, ignore)
-    check_packed(filepath, raw, cl, issues, ignore)
-    check_format_string(filepath, raw, cl, issues)
-    check_use_after_free(filepath, raw, cl, issues)
-    check_uninitialized(filepath, raw, cl, issues)
-    check_sign_compare(filepath, raw, cl, issues)
-    check_integer_overflow(filepath, raw, cl, issues)
-    check_resource_leak(filepath, raw, cl, issues)
-    check_snprintf_retval(filepath, raw, cl, issues)
+    off = ignore.rule_off
+    # ルール名→チェック関数マッピング (ignore引数が必要なものはlambda)
+    checks = [
+        ("null_deref",          lambda: check_null_deref(filepath, raw, cl, issues)),
+        ("unsafe_funcs",        lambda: check_unsafe_funcs(filepath, raw, cl, issues)),
+        ("memcpy_no_null",      lambda: check_memcpy_no_null(filepath, raw, cl, issues)),
+        ("array_index",         lambda: check_array_index(filepath, raw, cl, issues)),
+        ("double_free",         lambda: check_double_free(filepath, raw, cl, issues)),
+        ("return_inconsistency", lambda: check_return_inconsistency(filepath, raw, cl, issues)),
+        ("globals",             lambda: check_globals(filepath, raw, cl, issues, ignore)),
+        ("macros",              lambda: check_macros(filepath, raw, cl, issues, ignore)),
+        ("switch_fallthrough",  lambda: check_switch_fallthrough(filepath, raw, cl, issues)),
+        ("sizeof_pointer",      lambda: check_sizeof_pointer(filepath, raw, cl, issues)),
+        ("fd_leak",             lambda: check_fd_leak(filepath, raw, cl, issues)),
+        ("magic_numbers",       lambda: check_magic_numbers(filepath, raw, cl, issues, ignore)),
+        ("volatile",            lambda: check_volatile(filepath, raw, cl, issues, ignore)),
+        ("packed",              lambda: check_packed(filepath, raw, cl, issues, ignore)),
+        ("format_string",       lambda: check_format_string(filepath, raw, cl, issues)),
+        ("use_after_free",      lambda: check_use_after_free(filepath, raw, cl, issues)),
+        ("uninitialized",       lambda: check_uninitialized(filepath, raw, cl, issues)),
+        ("sign_compare",        lambda: check_sign_compare(filepath, raw, cl, issues)),
+        ("integer_overflow",    lambda: check_integer_overflow(filepath, raw, cl, issues)),
+        ("resource_leak",       lambda: check_resource_leak(filepath, raw, cl, issues)),
+        ("snprintf_retval",     lambda: check_snprintf_retval(filepath, raw, cl, issues)),
+        ("buffer_overrun",      lambda: check_buffer_overrun(filepath, raw, cl, issues)),
+        ("null_deref_branch",   lambda: check_null_deref_branch(filepath, raw, cl, issues)),
+        ("infinite_loop",       lambda: check_infinite_loop(filepath, raw, cl, issues)),
+        ("enum_switch",         lambda: check_enum_switch(filepath, raw, cl, issues)),
+        ("recursive_no_limit",  lambda: check_recursive_no_limit(filepath, raw, cl, issues)),
+        ("mutex_unlock",        lambda: check_mutex_unlock(filepath, raw, cl, issues)),
+    ]
+    for rule_name, check_fn in checks:
+        if rule_name not in off:
+            check_fn()
 
     # NOCHECK行単位抑制: 元ソースのコメントに "NOCHECK" があれば除外
     nocheck_lines: Set[int] = set()
@@ -1173,6 +1377,54 @@ def format_markdown(issues: List[Issue], filepath: str) -> str:
     return "\n".join(lines)
 
 
+def format_sarif(all_issues: Dict[str, List[Issue]]) -> str:
+    """SARIF 2.1.0形式で出力（GitHub Code Scanning連携用）"""
+    severity_to_level = {
+        Severity.CRITICAL: "error",
+        Severity.DESIGN: "warning",
+        Severity.MAINT: "note",
+    }
+    results = []
+    rules_seen: Dict[str, int] = {}
+    rules = []
+    for filepath, issues in all_issues.items():
+        for iss in issues:
+            # ルールIDを生成（メッセージの最初の数文字をハッシュ化）
+            rule_key = iss.message.split("。")[0] if "。" in iss.message else iss.message[:30]
+            if rule_key not in rules_seen:
+                rules_seen[rule_key] = len(rules)
+                rules.append({
+                    "id": f"CRV{len(rules)+1:03d}",
+                    "shortDescription": {"text": rule_key},
+                })
+            results.append({
+                "ruleId": rules[rules_seen[rule_key]]["id"],
+                "level": severity_to_level.get(iss.severity, "note"),
+                "message": {"text": iss.message},
+                "locations": [{
+                    "physicalLocation": {
+                        "artifactLocation": {"uri": filepath},
+                        "region": {"startLine": iss.line}
+                    }
+                }]
+            })
+    sarif = {
+        "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [{
+            "tool": {
+                "driver": {
+                    "name": "creview",
+                    "version": VERSION,
+                    "rules": rules,
+                }
+            },
+            "results": results,
+        }]
+    }
+    return json.dumps(sarif, ensure_ascii=False, indent=2)
+
+
 def format_json_v2(issues: List[Issue], target_label: str) -> str:
     obj = {
         "version": 2,
@@ -1223,12 +1475,17 @@ def main():
                         help="対象 .c/.h ファイルまたはディレクトリ")
     parser.add_argument("--spec", action="store_true",
                         help="仕様レビューモード (対象は仕様テキストファイル)")
-    parser.add_argument("--format", choices=["text", "json", "markdown"], default="text",
+    parser.add_argument("--format", choices=["text", "json", "markdown", "sarif"], default="text",
                         help="出力形式 (default: text)")
     parser.add_argument("--local-only", action="store_true",
                         help="ローカル静的解析のみ (API呼び出しなし)")
     parser.add_argument("--diff", action="store_true",
                         help="git diffの変更行のみレビュー")
+    parser.add_argument("--severity",
+                        choices=["critical", "design", "maint"],
+                        help="指定重大度のみ表示")
+    parser.add_argument("--count", action="store_true",
+                        help="重大度別集計のみ出力")
     parser.add_argument("--version", action="version",
                         version=f"creview {VERSION}")
     args = parser.parse_args()
@@ -1260,6 +1517,14 @@ def main():
         sys.exit(1)
 
     has_critical = False
+    sarif_issues: Dict[str, List[Issue]] = {}  # SARIF用に全ファイル蓄積
+    # --severity フィルタ用マッピング
+    severity_filter = None
+    if args.severity:
+        sev_map = {"critical": Severity.CRITICAL, "design": Severity.DESIGN, "maint": Severity.MAINT}
+        severity_filter = sev_map[args.severity]
+    # --count 集計用
+    count_totals: Dict[str, Dict[str, int]] = {}  # file -> {severity -> count}
 
     for fpath in files:
         ignore = find_ignore(fpath)
@@ -1276,16 +1541,33 @@ def main():
             diff_lines = get_diff_lines(fpath)
             if diff_lines is not None:
                 local_issues = filter_by_diff(local_issues, diff_lines)
-            # diff_lines=None（git外）の場合はフィルタなしで全件出力
 
-        if args.format == "json":
-            print(format_json_v2(local_issues, fpath))
-        elif args.format == "markdown":
-            print(format_markdown(local_issues, fpath))
+        # --severity: 重大度フィルタ
+        if severity_filter:
+            local_issues = [i for i in local_issues if i.severity == severity_filter]
+
+        # SARIF用に蓄積
+        if args.format == "sarif":
+            sarif_issues[fpath] = local_issues
+
+        # --count: 集計モード
+        if args.count:
+            count_totals[fpath] = {
+                "重大": sum(1 for i in local_issues if i.severity == Severity.CRITICAL),
+                "設計不明": sum(1 for i in local_issues if i.severity == Severity.DESIGN),
+                "保守危険": sum(1 for i in local_issues if i.severity == Severity.MAINT),
+            }
+        elif args.format == "sarif":
+            pass  # 全ファイル処理後にまとめて出力
         else:
-            if local_issues:
-                print(f"── ローカル解析: {fpath} ──")
-                print(format_text(local_issues))
+            if args.format == "json":
+                print(format_json_v2(local_issues, fpath))
+            elif args.format == "markdown":
+                print(format_markdown(local_issues, fpath))
+            else:
+                if local_issues:
+                    print(f"── ローカル解析: {fpath} ──")
+                    print(format_text(local_issues))
 
         if any(i.severity == Severity.CRITICAL for i in local_issues):
             has_critical = True
@@ -1329,6 +1611,22 @@ def main():
                         "file": fpath,
                         "result": "レビュー失敗"
                     }, ensure_ascii=False))
+
+    # --format sarif: まとめて出力
+    if args.format == "sarif":
+        print(format_sarif(sarif_issues))
+
+    # --count: 集計出力
+    if args.count:
+        total_c, total_d, total_m = 0, 0, 0
+        for fpath, counts in count_totals.items():
+            c, d, m = counts["重大"], counts["設計不明"], counts["保守危険"]
+            total_c += c
+            total_d += d
+            total_m += m
+            if c + d + m > 0:
+                print(f"{fpath}: 重大={c} 設計不明={d} 保守危険={m}")
+        print(f"合計: 重大={total_c} 設計不明={total_d} 保守危険={total_m}")
 
     sys.exit(1 if has_critical else 0)
 

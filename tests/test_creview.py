@@ -225,5 +225,154 @@ class TestFdLeak(unittest.TestCase):
         self.assertTrue(has_issue(issues, creview.Severity.CRITICAL, "fclose"))
 
 
+# ── v0.7.0 新チェックのテスト ──
+
+class TestBufferOverrun(unittest.TestCase):
+    def test_detect_strncpy_overflow(self):
+        src = '''void f() {
+            char buf[10];
+            strncpy(buf, src, 20);
+        }'''
+        issues = run_checks(src)
+        self.assertTrue(has_issue(issues, creview.Severity.CRITICAL, "バッファオーバーラン"))
+
+    def test_safe_strncpy(self):
+        src = '''void f() {
+            char buf[32];
+            strncpy(buf, src, 32);
+        }'''
+        issues = run_checks(src)
+        self.assertFalse(has_issue(issues, keyword="バッファオーバーラン"))
+
+
+class TestInfiniteLoop(unittest.TestCase):
+    def test_detect_no_break(self):
+        src = '''void f() {
+            while (1) {
+                int x = 1;
+            }
+        }'''
+        issues = run_checks(src)
+        self.assertTrue(has_issue(issues, creview.Severity.DESIGN, "無限ループ"))
+
+    def test_safe_with_break(self):
+        src = '''void f() {
+            while (1) {
+                if (done) break;
+            }
+        }'''
+        issues = run_checks(src)
+        self.assertFalse(has_issue(issues, keyword="無限ループ"))
+
+
+class TestEnumSwitch(unittest.TestCase):
+    def test_detect_no_default(self):
+        src = '''enum Color { RED, GREEN, BLUE };
+        void f() {
+            enum Color c = RED;
+            switch (c) {
+                case RED: break;
+            }
+        }'''
+        issues = run_checks(src)
+        self.assertTrue(has_issue(issues, creview.Severity.DESIGN, "defaultなし"))
+
+    def test_safe_with_default(self):
+        src = '''enum Color { RED, GREEN, BLUE };
+        void f() {
+            enum Color c = RED;
+            switch (c) {
+                case RED: break;
+                default: break;
+            }
+        }'''
+        issues = run_checks(src)
+        self.assertFalse(has_issue(issues, keyword="defaultなし"))
+
+
+class TestRecursiveNoLimit(unittest.TestCase):
+    def test_detect(self):
+        src = '''int factorial(int n) {
+            return n * factorial(n - 1);
+        }'''
+        issues = run_checks(src)
+        self.assertTrue(has_issue(issues, creview.Severity.MAINT, "自己再帰"))
+
+    def test_safe_with_depth(self):
+        src = '''int f(int n, int depth) {
+            if (depth > 100) return 0;
+            return f(n - 1, depth + 1);
+        }'''
+        issues = run_checks(src)
+        self.assertFalse(has_issue(issues, keyword="自己再帰"))
+
+
+class TestMutexUnlock(unittest.TestCase):
+    def test_detect_no_unlock(self):
+        src = '''void f() {
+            pthread_mutex_lock(&mtx);
+            do_work();
+        }'''
+        issues = run_checks(src)
+        self.assertTrue(has_issue(issues, creview.Severity.CRITICAL, "デッドロック"))
+
+    def test_safe_with_unlock(self):
+        src = '''void f() {
+            pthread_mutex_lock(&mtx);
+            do_work();
+            pthread_mutex_unlock(&mtx);
+        }'''
+        issues = run_checks(src)
+        self.assertFalse(has_issue(issues, keyword="デッドロック"))
+
+
+class TestRuleOff(unittest.TestCase):
+    def test_rule_off_disables_check(self):
+        import tempfile
+        src = '''void f() {
+            char *p = malloc(100);
+            *p = 'a';
+        }'''
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.c', delete=False,
+                                          encoding='utf-8') as f:
+            f.write(src)
+            f.flush()
+            path = f.name
+        try:
+            ignore = creview.IgnoreConfig()
+            ignore.rule_off.add("null_deref")
+            issues = creview.run_local_analysis(path, ignore)
+            self.assertFalse(has_issue(issues, keyword="NULLチェックなし"))
+        finally:
+            os.unlink(path)
+
+
+class TestSeverityFilter(unittest.TestCase):
+    def test_filter(self):
+        issues = [
+            creview.Issue(creview.Severity.CRITICAL, "t.c", 1, "重大"),
+            creview.Issue(creview.Severity.DESIGN, "t.c", 2, "設計"),
+            creview.Issue(creview.Severity.MAINT, "t.c", 3, "保守"),
+        ]
+        filtered = [i for i in issues if i.severity == creview.Severity.CRITICAL]
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered[0].message, "重大")
+
+
+class TestSarifFormat(unittest.TestCase):
+    def test_output_valid_json(self):
+        import json
+        issues = {
+            "test.c": [
+                creview.Issue(creview.Severity.CRITICAL, "test.c", 10, "テスト指摘"),
+            ]
+        }
+        sarif = creview.format_sarif(issues)
+        data = json.loads(sarif)
+        self.assertEqual(data["version"], "2.1.0")
+        self.assertEqual(len(data["runs"][0]["results"]), 1)
+        self.assertEqual(data["runs"][0]["results"][0]["level"], "error")
+
+
 if __name__ == "__main__":
     unittest.main()
