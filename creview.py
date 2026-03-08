@@ -1298,8 +1298,12 @@ def _get_obj_func_sizes(filepath: str) -> Optional[Dict[str, int]]:
             # 最後のシンボル: 隣接シンボルがないためサイズ推定不能
             # (セクションパディングで膨らむので信頼できない)
             # → reliable に含めず、他に信頼できるサイズがなければNone返却
-        # 信頼できるサイズが1つもなければソース解析にフォールバック
-        return reliable if reliable else None
+        if not reliable:
+            return None
+        # 全サイズ同一=アライメント由来(Windows COFF等)→信頼できない
+        if len(set(reliable.values())) <= 1:
+            return None
+        return reliable
     except (OSError, subprocess.TimeoutExpired):
         return None
     finally:
