@@ -1273,6 +1273,20 @@ def _get_obj_func_sizes(filepath: str) -> Optional[Dict[str, int]]:
                     sizes[fname] = size
             return sizes if sizes else None
         # サイズ列がない場合: 全シンボルをアドレス順ソートし隣接差から推定
+        # sizeコマンドでテキストセクション総サイズを取得(最後のシンボル用)
+        text_total = None
+        try:
+            size_result = subprocess.run(
+                ["size", obj_path],
+                capture_output=True, text=True, timeout=10)
+            if size_result.returncode == 0:
+                slines = size_result.stdout.strip().splitlines()
+                if len(slines) >= 2:
+                    sparts = slines[1].split()
+                    if sparts:
+                        text_total = int(sparts[0])
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            pass
         all_symbols.sort(key=lambda s: s[0])
         sizes = {}
         for idx, (addr, fname, _, is_user) in enumerate(all_symbols):
@@ -1286,8 +1300,11 @@ def _get_obj_func_sizes(filepath: str) -> Optional[Dict[str, int]]:
                     break
             if next_addr is not None:
                 sizes[fname] = next_addr - addr
+            elif text_total is not None:
+                # 最後のシンボル: テキストセクション総サイズから算出
+                sizes[fname] = text_total - addr
             else:
-                # 最後のシンボル: サイズ不明→フォールバック解析に委ねる
+                # フォールバック: サイズ不明
                 sizes[fname] = 0
         return sizes if sizes else None
     except (OSError, subprocess.TimeoutExpired):
