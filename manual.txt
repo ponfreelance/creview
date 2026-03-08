@@ -1,5 +1,5 @@
 ============================================
-C設計レビューAI  CReview v0.7.0
+C設計レビューAI  CReview v0.8.0
 ============================================
 
 
@@ -46,7 +46,7 @@ C設計レビューAI  CReview v0.7.0
   creview --local-only main.c
 
 APIキー無しでも使えます。
-ローカル静的解析27パターンのみ実行。
+ローカル静的解析33パターンのみ実行。
 
 
 ■ 差分モード（変更行のみレビュー）
@@ -101,7 +101,7 @@ critical / design / maint から選択。
   将来バグ化可能。
 
 
-■ ローカル静的解析パターン一覧（27種）
+■ ローカル静的解析パターン一覧（33種）
 --------------------------------------------
 
   [重大]
@@ -119,23 +119,29 @@ critical / design / maint から選択。
   12. open/socket/pipe リソースリーク
   13. 固定バッファオーバーラン (strncpy/memcpyサイズ超過)
   14. pthread_mutex_lock/unlock不整合 (デッドロック)
+  15. TOCTOU競合 (access→open等)
+  16. シグナルハンドラ内async-signal-unsafe関数
 
   [設計不明]
-  15. return値と空returnの混在
-  16. switch case fall-through
-  17. マクロ引数の括弧未保護
-  18. volatile変数の非アトミック操作
-  19. packed構造体のアラインメント問題
-  20. signed/unsigned混合比較
-  21. NULLチェック分岐後のポインタ使用
-  22. 無限ループ (break/returnなし)
-  23. enum型switchでdefaultなし
+  17. return値と空returnの混在
+  18. switch case fall-through
+  19. マクロ引数の括弧未保護
+  20. volatile変数の非アトミック操作
+  21. packed構造体のアラインメント問題
+  22. signed/unsigned混合比較
+  23. NULLチェック分岐後のポインタ使用
+  24. 無限ループ (break/returnなし)
+  25. enum型switchでdefaultなし
+  26. 暗黙切り詰めキャスト
+  27. ビットフィールド符号未指定
+  28. 可変長配列(VLA)使用
 
   [保守危険]
-  24. グローバル変数の関数内直接更新
-  25. マジックナンバー
-  26. snprintf戻り値無視
-  27. 深さ制限なし自己再帰
+  29. グローバル変数の関数内直接更新
+  30. マジックナンバー
+  31. snprintf戻り値無視
+  32. 深さ制限なし自己再帰
+  33. goto前方ジャンプ
 
 
 ■ 警告抑制 .creviewignore
@@ -182,7 +188,11 @@ critical / design / maint から選択。
   sign_compare, integer_overflow, resource_leak,
   snprintf_retval, buffer_overrun, null_deref_branch,
   infinite_loop, enum_switch, recursive_no_limit,
-  mutex_unlock
+  mutex_unlock, toctou, signal_unsafe,
+  cast_truncation, bitfield_sign, vla, goto_misuse
+
+全ルール名の一覧表示：
+  creview --list-rules
 
 
 ■ 行単位の抑制 (NOCHECK)
@@ -192,6 +202,43 @@ critical / design / maint から選択。
 その行の指摘を全て抑制：
 
   char *p = malloc(100);  // NOCHECK
+
+
+■ 修正ヒント
+--------------------------------------------
+
+  creview --fix-hint --local-only main.c
+
+各指摘に修正方法のヒントを付与して表示。
+
+
+■ ベースライン差分
+--------------------------------------------
+
+  creview --format json --local-only src/ > baseline.json
+  creview --baseline baseline.json --local-only src/
+
+前回結果をベースラインとし、新規指摘のみ表示。
+CIで新規バグのみ検出したい場合に有効。
+
+
+■ 終了コード閾値
+--------------------------------------------
+
+  creview --exit-code design --local-only src/
+
+終了コード1を返す重大度の閾値を変更。
+  critical (デフォルト): 重大指摘があれば1
+  design:               設計不明以上で1
+  maint:                保守危険以上で1
+
+
+■ ルール一覧表示
+--------------------------------------------
+
+  creview --list-rules
+
+利用可能な全ルール名と説明を表示。
 
 
 ■ 注意事項
@@ -209,16 +256,19 @@ critical / design / maint から選択。
 --------------------------------------------
 
 1. 実装前    creview --spec spec.txt
-2. 実装後    creview src/
+2. 実装後    creview --fix-hint src/
 3. PR前      creview --diff --local-only src/
 4. CI        creview --format sarif --local-only src/ > results.sarif
+5. CI差分    creview --baseline prev.json --local-only src/
 
 
 ■ 終了コード
 --------------------------------------------
 
-  0  重大指摘なし
-  1  重大指摘あり
+  0  閾値未満の指摘のみ（または指摘なし）
+  1  閾値以上の指摘あり
+
+※ 閾値は --exit-code で変更可能（デフォルト: critical）
 
 
 ■ ファイル構成

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-creview v0.7.0 - C言語設計レビュー専用CLI
+creview v0.8.0 - C言語設計レビュー専用CLI
 指摘専用。コード生成・修正案・改善案 一切なし。
 ローカル静的解析 + Claude API深層レビュー 二段構成。
 """
@@ -20,7 +20,7 @@ from fnmatch import fnmatch
 import subprocess
 
 # ─── バージョン / 定数 ────────────────────────────────
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 IGNOREFILE = ".creviewignore"
 CONFIGFILE = "config.txt"
 MAX_CHUNK_BYTES = 80_000
@@ -994,6 +994,160 @@ def check_mutex_unlock(fp, raw, cl, issues):
                     f"pthread_mutex_lock({mutex})に対応するunlockなし。デッドロック"))
 
 
+def check_toctou(fp, raw, cl, issues):
+    """TOCTOU (Time-of-check to time-of-use) 競合検出"""
+    # access() → open() パターン
+    check_funcs = {"access", "stat", "lstat", "fstat"}
+    use_funcs = {"open", "fopen", "remove", "unlink", "rename", "chmod", "chown", "mkdir"}
+    for i, line in enumerate(cl):
+        for cfunc in check_funcs:
+            if not re.search(rf'\b{cfunc}\s*\(', line):
+                continue
+            # 直後数行でuse関数が呼ばれていないか
+            for j in range(i + 1, min(i + 10, len(cl))):
+                for ufunc in use_funcs:
+                    if re.search(rf'\b{ufunc}\s*\(', cl[j]):
+                        issues.append(Issue(Severity.CRITICAL, fp, i + 1,
+                            f"{cfunc}()後に{ufunc}()を使用(TOCTOU)。"
+                            f"チェックと操作の間にファイルが変更される競合条件"))
+                        break
+                else:
+                    continue
+                break
+
+
+def check_signal_unsafe(fp, raw, cl, issues):
+    """シグナルハンドラ内のasync-signal-unsafe関数呼び出し検出"""
+    # async-signal-unsafeな関数群
+    unsafe_in_signal = {
+        "printf", "fprintf", "sprintf", "snprintf", "puts",
+        "malloc", "calloc", "realloc", "free",
+        "exit", "fopen", "fclose", "fread", "fwrite",
+        "syslog", "strerror", "localtime", "gmtime",
+    }
+    # signal()/sigaction()でハンドラ関数名を収集
+    handler_re = re.compile(r'\bsignal\s*\(\s*\w+\s*,\s*(\w+)\s*\)')
+    sa_handler_re = re.compile(r'\.sa_handler\s*=\s*(\w+)')
+    handlers: Set[str] = set()
+    for line in cl:
+        m = handler_re.search(line)
+        if m and m.group(1) not in ("SIG_IGN", "SIG_DFL"):
+            handlers.add(m.group(1))
+        m = sa_handler_re.search(line)
+        if m:
+            handlers.add(m.group(1))
+    if not handlers:
+        return
+    # ハンドラ関数の本体を探索
+    func_re = re.compile(r'^(?:static\s+)?(?:void|int)\s+(\w+)\s*\(')
+    i = 0
+    while i < len(cl):
+        fm = func_re.match(cl[i])
+        if not fm or fm.group(1) not in handlers or '{' not in cl[i]:
+            i += 1
+            continue
+        func_name = fm.group(1)
+        brace = 0
+        for j in range(i, len(cl)):
+            brace += cl[j].count('{') - cl[j].count('}')
+            if j > i:
+                for uf in unsafe_in_signal:
+                    if re.search(rf'\b{uf}\s*\(', cl[j]):
+                        issues.append(Issue(Severity.CRITICAL, fp, j + 1,
+                            f"シグナルハンドラ{func_name}内で{uf}()使用。"
+                            f"async-signal-unsafe関数でデッドロック・未定義動作"))
+            if brace <= 0 and j > i:
+                i = j
+                break
+        i += 1
+
+
+def check_cast_truncation(fp, raw, cl, issues):
+    """暗黙切り詰めキャスト検出"""
+    # (int)long_var, (short)int_var, (char)int_var 等
+    wider_types = {"long", "size_t", "uint64_t", "int64_t", "ssize_t", "off_t", "ptrdiff_t"}
+    narrow_types = {"int", "short", "char", "uint8_t", "int8_t", "uint16_t", "int16_t", "uint32_t", "int32_t"}
+    # 明示的キャスト
+    cast_re = re.compile(r'\(\s*((?:unsigned\s+)?(?:' +
+                          '|'.join(narrow_types) +
+                          r'))\s*\)\s*(\w+)')
+    # wide型変数の収集
+    wide_vars: Set[str] = set()
+    wide_re = re.compile(r'\b(' + '|'.join(wider_types) + r')\s+(\w+)')
+    for line in cl:
+        for m in wide_re.finditer(line):
+            wide_vars.add(m.group(2))
+    if not wide_vars:
+        return
+    for i, line in enumerate(cl):
+        for m in cast_re.finditer(line):
+            target_type, var = m.group(1), m.group(2)
+            if var in wide_vars:
+                issues.append(Issue(Severity.DESIGN, fp, i + 1,
+                    f"({target_type}){var}でワイド型を切り詰め。上位ビット消失"))
+
+
+def check_bitfield_sign(fp, raw, cl, issues):
+    """ビットフィールドの符号未指定検出"""
+    # struct内の int field:N (1ビットのintは-1 or 0で処理系依存)
+    # unsigned int / signed int は明示済みなので除外
+    bf_re = re.compile(r'(?<!\bunsigned\s)(?<!\bsigned\s)\bint\s+(\w+)\s*:\s*(\d+)\s*;')
+    for i, line in enumerate(cl):
+        m = bf_re.search(line)
+        if m:
+            field, bits = m.group(1), int(m.group(2))
+            if bits <= 16:
+                issues.append(Issue(Severity.DESIGN, fp, i + 1,
+                    f"ビットフィールド{field}:{bits}が符号未指定int。"
+                    f"signedかunsignedか処理系依存"))
+
+
+def check_vla(fp, raw, cl, issues):
+    """可変長配列(VLA)使用検出"""
+    # 関数内で type arr[var] パターン (varが数値リテラルでない)
+    arr_re = re.compile(
+        r'\b(?:int|char|short|long|float|double|unsigned\s+\w+|uint\w+|int\w+)\s+'
+        r'(\w+)\s*\[\s*([a-zA-Z_]\w*)\s*\]')
+    brace_depth = 0
+    for i, line in enumerate(cl):
+        brace_depth += line.count('{') - line.count('}')
+        if brace_depth < 1:
+            continue
+        m = arr_re.search(line)
+        if m:
+            arr_name, size_var = m.group(1), m.group(2)
+            # sizeof, 定数名の除外
+            if size_var.isupper() or size_var.startswith("sizeof"):
+                continue
+            issues.append(Issue(Severity.MAINT, fp, i + 1,
+                f"可変長配列{arr_name}[{size_var}]使用。"
+                f"大きな値でスタックオーバーフロー"))
+
+
+def check_goto_misuse(fp, raw, cl, issues):
+    """goto前方ジャンプ検出（エラー処理以外）"""
+    # gotoの使用箇所とラベル位置を収集
+    goto_re = re.compile(r'\bgoto\s+(\w+)\s*;')
+    label_re = re.compile(r'^(\w+)\s*:(?!:)')  # ::はC++スコープ解決演算子除外
+    labels: Dict[str, int] = {}  # label -> line
+    gotos: List[Tuple[int, str]] = []  # (line, label)
+    for i, line in enumerate(cl):
+        m = label_re.match(line.strip())
+        if m and m.group(1) not in ("default", "case", "public", "private", "protected"):
+            labels[m.group(1)] = i
+        m = goto_re.search(line)
+        if m:
+            gotos.append((i, m.group(1)))
+    # 前方ジャンプ（上方向へのgoto）を検出
+    for goto_line, label_name in gotos:
+        if label_name in labels:
+            label_line = labels[label_name]
+            if label_line < goto_line:
+                issues.append(Issue(Severity.MAINT, fp, goto_line + 1,
+                    f"goto {label_name}が前方(上方向)ジャンプ。"
+                    f"ループ構造化を推奨。可読性・保守性低下"))
+
+
 def check_packed(fp, raw, cl, issues, ignore):
     """packed構造体の危険パターン検出"""
     if ignore.packed_ok:
@@ -1089,6 +1243,12 @@ def run_local_analysis(filepath: str, ignore: IgnoreConfig) -> List[Issue]:
         ("enum_switch",         lambda: check_enum_switch(filepath, raw, cl, issues)),
         ("recursive_no_limit",  lambda: check_recursive_no_limit(filepath, raw, cl, issues)),
         ("mutex_unlock",        lambda: check_mutex_unlock(filepath, raw, cl, issues)),
+        ("toctou",              lambda: check_toctou(filepath, raw, cl, issues)),
+        ("signal_unsafe",       lambda: check_signal_unsafe(filepath, raw, cl, issues)),
+        ("cast_truncation",     lambda: check_cast_truncation(filepath, raw, cl, issues)),
+        ("bitfield_sign",       lambda: check_bitfield_sign(filepath, raw, cl, issues)),
+        ("vla",                 lambda: check_vla(filepath, raw, cl, issues)),
+        ("goto_misuse",         lambda: check_goto_misuse(filepath, raw, cl, issues)),
     ]
     for rule_name, check_fn in checks:
         if rule_name not in off:
@@ -1311,6 +1471,89 @@ def run_api_review_spec(spec_path: str, config: AppConfig) -> str:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ルール定義・ヒントマッピング
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+RULE_DESCRIPTIONS = {
+    "null_deref":          "malloc/calloc/realloc NULLチェック漏れ",
+    "unsafe_funcs":        "gets/sprintf/strcpy/strcat使用",
+    "memcpy_no_null":      "memcpy/memmove/memset NULLポインタ未検証",
+    "array_index":         "外部入力の配列添字バウンドチェック漏れ",
+    "double_free":         "二重free",
+    "return_inconsistency": "return値と空returnの混在",
+    "globals":             "グローバル変数の関数内直接更新",
+    "macros":              "マクロ引数の括弧未保護",
+    "switch_fallthrough":  "switch case fall-through",
+    "sizeof_pointer":      "sizeof(ポインタ)",
+    "fd_leak":             "fopen/fcloseリーク",
+    "magic_numbers":       "マジックナンバー",
+    "volatile":            "volatile変数の非アトミック操作",
+    "packed":              "packed構造体のアラインメント問題",
+    "format_string":       "フォーマット文字列脆弱性",
+    "use_after_free":      "use-after-free",
+    "uninitialized":       "未初期化変数使用",
+    "sign_compare":        "signed/unsigned混合比較",
+    "integer_overflow":    "整数オーバーフロー(malloc乗算)",
+    "resource_leak":       "open/socket/pipeリソースリーク",
+    "snprintf_retval":     "snprintf戻り値無視",
+    "buffer_overrun":      "バッファオーバーラン",
+    "null_deref_branch":   "NULLチェック分岐後のポインタ使用",
+    "infinite_loop":       "無限ループ(break/returnなし)",
+    "enum_switch":         "enum型switchでdefaultなし",
+    "recursive_no_limit":  "深さ制限なし自己再帰",
+    "mutex_unlock":        "pthread_mutex_lock/unlock不整合",
+    "toctou":              "TOCTOU競合(access→open等)",
+    "signal_unsafe":       "シグナルハンドラ内async-signal-unsafe関数",
+    "cast_truncation":     "暗黙切り詰めキャスト",
+    "bitfield_sign":       "ビットフィールド符号未指定",
+    "vla":                 "可変長配列(VLA)使用",
+    "goto_misuse":         "goto前方ジャンプ",
+}
+
+# --fix-hint用: メッセージキーワード → 修正ヒント
+FIX_HINTS = {
+    "NULLチェックなし": "→ if (ptr == NULL) で戻り値を検証",
+    "gets使用": "→ fgets(buf, sizeof(buf), stdin) に置換",
+    "sprintf使用": "→ snprintf(buf, sizeof(buf), ...) に置換",
+    "strcpy使用": "→ strncpy + 終端NUL保証に置換",
+    "strcat使用": "→ strncat + バッファ残量計算に置換",
+    "NULL未検証": "→ 呼び出し前に if (ptr == NULL) を追加",
+    "二重free": "→ free直後に ptr = NULL を追加",
+    "dangling pointer": "→ free直後に ptr = NULL を追加",
+    "use-after-free": "→ free直後に ptr = NULL; 以降参照禁止",
+    "未初期化変数": "→ 宣言時に = 0 または適切な初期値を設定",
+    "書式文字列": "→ printf(\"%s\", var) のようにフォーマット指定子経由で出力",
+    "オーバーフロー未検証": "→ 乗算前に SIZE_MAX / sizeof(T) > n を検証",
+    "fdリーク": "→ 対応するclose()を追加",
+    "ソケットリーク": "→ 対応するclose()を追加",
+    "fclose": "→ 対応するfclose()を追加",
+    "sizeof": "→ sizeof(*ptr) または sizeof(配列) / sizeof(配列[0]) を使用",
+    "fall-through": "→ break; または /* fall through */ コメントを追加",
+    "バッファオーバーラン": "→ 第3引数をsizeof(dst)以下に制限",
+    "デッドロック": "→ 全パスでpthread_mutex_unlock()を確保",
+    "TOCTOU": "→ open()の戻り値で直接操作。access()を除去",
+    "async-signal-unsafe": "→ write()やvolatile sig_atomic_tフラグを使用",
+    "切り詰め": "→ キャスト前に値域チェック、またはワイド型のまま使用",
+    "符号未指定": "→ unsigned int field:N または signed int field:N に明示",
+    "可変長配列": "→ malloc+freeまたは固定サイズ配列に置換",
+    "前方": "→ while/forループに構造化、またはエラー処理gotoのみ使用",
+    "snprintf": "→ int ret = snprintf(...); if (ret >= sizeof(buf)) で切り詰め検出",
+    "マジックナンバー": "→ #define NAME value または enum で定数定義",
+    "defaultなし": "→ default: ケースを追加してassert/ログ出力",
+    "自己再帰": "→ depth引数を追加し上限チェック",
+    "無限ループ": "→ break/return条件を追加、またはコメントで意図を明示",
+}
+
+
+def get_fix_hint(message: str) -> str:
+    """メッセージからfix-hintを返す"""
+    for keyword, hint in FIX_HINTS.items():
+        if keyword in message:
+            return hint
+    return ""
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 出力フォーマッタ
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -1346,7 +1589,7 @@ def filter_by_diff(issues: List[Issue], diff_lines: Set[int]) -> List[Issue]:
     return [iss for iss in issues if iss.line in diff_lines]
 
 
-def format_text(issues: List[Issue]) -> str:
+def format_text(issues: List[Issue], fix_hint: bool = False) -> str:
     if not issues:
         return "重大なし\n設計不明なし\n保守危険なし"
     lines = []
@@ -1354,11 +1597,15 @@ def format_text(issues: List[Issue]) -> str:
         lines.append(f"[{iss.severity.value}]")
         lines.append(f"{iss.filepath}:{iss.line}")
         lines.append(iss.message)
+        if fix_hint:
+            hint = get_fix_hint(iss.message)
+            if hint:
+                lines.append(hint)
         lines.append("")
     return "\n".join(lines)
 
 
-def format_markdown(issues: List[Issue], filepath: str) -> str:
+def format_markdown(issues: List[Issue], filepath: str, fix_hint: bool = False) -> str:
     """Markdown形式で指摘を出力"""
     lines = [f"## {filepath}\n"]
     if not issues:
@@ -1372,7 +1619,12 @@ def format_markdown(issues: List[Issue], filepath: str) -> str:
         icon = severity_map[sev]
         lines.append(f"### {icon} {sev.value} ({len(sev_issues)}件)\n")
         for iss in sev_issues:
-            lines.append(f"- **L{iss.line}**: {iss.message}")
+            hint_str = ""
+            if fix_hint:
+                hint = get_fix_hint(iss.message)
+                if hint:
+                    hint_str = f" `{hint}`"
+            lines.append(f"- **L{iss.line}**: {iss.message}{hint_str}")
         lines.append("")
     return "\n".join(lines)
 
@@ -1471,7 +1723,7 @@ def main():
         prog="creview",
         description="C言語設計レビュー (指摘専用。コード生成・修正案 一切なし)",
     )
-    parser.add_argument("targets", nargs="+",
+    parser.add_argument("targets", nargs="*",
                         help="対象 .c/.h ファイルまたはディレクトリ")
     parser.add_argument("--spec", action="store_true",
                         help="仕様レビューモード (対象は仕様テキストファイル)")
@@ -1486,9 +1738,28 @@ def main():
                         help="指定重大度のみ表示")
     parser.add_argument("--count", action="store_true",
                         help="重大度別集計のみ出力")
+    parser.add_argument("--fix-hint", action="store_true",
+                        help="各指摘に修正ヒントを付与")
+    parser.add_argument("--baseline",
+                        help="ベースラインJSONファイル。新規指摘のみ表示")
+    parser.add_argument("--exit-code",
+                        choices=["critical", "design", "maint"],
+                        default="critical",
+                        help="終了コード1を返す閾値 (default: critical)")
+    parser.add_argument("--list-rules", action="store_true",
+                        help="利用可能な全ルール名を表示して終了")
     parser.add_argument("--version", action="version",
                         version=f"creview {VERSION}")
     args = parser.parse_args()
+
+    # --list-rules: ルール一覧表示して終了
+    if args.list_rules:
+        for name, desc in RULE_DESCRIPTIONS.items():
+            print(f"  {name:24s} {desc}")
+        sys.exit(0)
+
+    if not args.targets:
+        parser.error("対象ファイルまたはディレクトリを指定してください")
 
     config = load_config()
 
@@ -1517,6 +1788,8 @@ def main():
         sys.exit(1)
 
     has_critical = False
+    has_design = False
+    has_maint = False
     sarif_issues: Dict[str, List[Issue]] = {}  # SARIF用に全ファイル蓄積
     # --severity フィルタ用マッピング
     severity_filter = None
@@ -1525,6 +1798,21 @@ def main():
         severity_filter = sev_map[args.severity]
     # --count 集計用
     count_totals: Dict[str, Dict[str, int]] = {}  # file -> {severity -> count}
+    # --baseline: ベースライン読み込み
+    baseline_issues = None
+    if args.baseline:
+        try:
+            with open(args.baseline, "r", encoding="utf-8") as f:
+                bl_data = json.load(f)
+            if isinstance(bl_data, dict) and "issues" in bl_data:
+                baseline_issues = bl_data["issues"]
+            elif isinstance(bl_data, list):
+                baseline_issues = bl_data
+            else:
+                baseline_issues = []
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"ベースライン読み込み失敗: {e}", file=sys.stderr)
+            baseline_issues = []
 
     for fpath in files:
         ignore = find_ignore(fpath)
@@ -1546,6 +1834,14 @@ def main():
         if severity_filter:
             local_issues = [i for i in local_issues if i.severity == severity_filter]
 
+        # --baseline: ベースラインとの差分
+        if baseline_issues is not None:
+            baseline_set = set()
+            for bi in baseline_issues:
+                baseline_set.add((bi.get("file", ""), bi.get("line", 0), bi.get("message", "")))
+            local_issues = [i for i in local_issues
+                            if (i.filepath, i.line, i.message) not in baseline_set]
+
         # SARIF用に蓄積
         if args.format == "sarif":
             sarif_issues[fpath] = local_issues
@@ -1560,17 +1856,22 @@ def main():
         elif args.format == "sarif":
             pass  # 全ファイル処理後にまとめて出力
         else:
+            use_hint = args.fix_hint
             if args.format == "json":
                 print(format_json_v2(local_issues, fpath))
             elif args.format == "markdown":
-                print(format_markdown(local_issues, fpath))
+                print(format_markdown(local_issues, fpath, fix_hint=use_hint))
             else:
                 if local_issues:
                     print(f"── ローカル解析: {fpath} ──")
-                    print(format_text(local_issues))
+                    print(format_text(local_issues, fix_hint=use_hint))
 
         if any(i.severity == Severity.CRITICAL for i in local_issues):
             has_critical = True
+        if any(i.severity == Severity.DESIGN for i in local_issues):
+            has_design = True
+        if any(i.severity == Severity.MAINT for i in local_issues):
+            has_maint = True
 
         # Phase 2: API深層レビュー (--local-onlyでスキップ)
         if args.local_only:
@@ -1628,7 +1929,15 @@ def main():
                 print(f"{fpath}: 重大={c} 設計不明={d} 保守危険={m}")
         print(f"合計: 重大={total_c} 設計不明={total_d} 保守危険={total_m}")
 
-    sys.exit(1 if has_critical else 0)
+    # --exit-code 閾値判定
+    exit_threshold = args.exit_code
+    if exit_threshold == "critical":
+        should_fail = has_critical
+    elif exit_threshold == "design":
+        should_fail = has_critical or has_design
+    else:  # maint
+        should_fail = has_critical or has_design or has_maint
+    sys.exit(1 if should_fail else 0)
 
 
 if __name__ == "__main__":

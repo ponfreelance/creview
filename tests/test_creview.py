@@ -374,5 +374,153 @@ class TestSarifFormat(unittest.TestCase):
         self.assertEqual(data["runs"][0]["results"][0]["level"], "error")
 
 
+# ── v0.8.0 新チェックのテスト ──
+
+class TestToctou(unittest.TestCase):
+    def test_detect_access_open(self):
+        src = '''void f(const char *path) {
+            if (access(path, R_OK) == 0) {
+                int fd = open(path, O_RDONLY);
+            }
+        }'''
+        issues = run_checks(src)
+        self.assertTrue(has_issue(issues, creview.Severity.CRITICAL, "TOCTOU"))
+
+    def test_no_false_positive(self):
+        src = '''void f() {
+            int fd = open("/tmp/x", O_RDONLY);
+            close(fd);
+        }'''
+        issues = run_checks(src)
+        self.assertFalse(has_issue(issues, keyword="TOCTOU"))
+
+
+class TestSignalUnsafe(unittest.TestCase):
+    def test_detect_printf_in_handler(self):
+        src = '''void handler(int sig) {
+            printf("signal %d\\n", sig);
+        }
+        void setup() {
+            signal(SIGINT, handler);
+        }'''
+        issues = run_checks(src)
+        self.assertTrue(has_issue(issues, creview.Severity.CRITICAL, "async-signal-unsafe"))
+
+    def test_safe_handler(self):
+        src = '''volatile sig_atomic_t flag = 0;
+        void handler(int sig) {
+            flag = 1;
+        }
+        void setup() {
+            signal(SIGINT, handler);
+        }'''
+        issues = run_checks(src)
+        self.assertFalse(has_issue(issues, keyword="async-signal-unsafe"))
+
+
+class TestCastTruncation(unittest.TestCase):
+    def test_detect(self):
+        src = '''void f() {
+            long big = 0x100000000L;
+            int small = (int)big;
+        }'''
+        issues = run_checks(src)
+        self.assertTrue(has_issue(issues, creview.Severity.DESIGN, "切り詰め"))
+
+
+class TestBitfieldSign(unittest.TestCase):
+    def test_detect(self):
+        src = '''struct flags {
+            int ready : 1;
+        };'''
+        issues = run_checks(src)
+        self.assertTrue(has_issue(issues, creview.Severity.DESIGN, "符号未指定"))
+
+    def test_unsigned_safe(self):
+        src = '''struct flags {
+            unsigned int ready : 1;
+        };'''
+        issues = run_checks(src)
+        self.assertFalse(has_issue(issues, keyword="符号未指定"))
+
+
+class TestVla(unittest.TestCase):
+    def test_detect(self):
+        src = '''void f(int n) {
+            char buf[n];
+        }'''
+        issues = run_checks(src)
+        self.assertTrue(has_issue(issues, creview.Severity.MAINT, "可変長配列"))
+
+    def test_constant_safe(self):
+        src = '''void f() {
+            char buf[BUFSIZE];
+        }'''
+        issues = run_checks(src)
+        self.assertFalse(has_issue(issues, keyword="可変長配列"))
+
+
+class TestGotoMisuse(unittest.TestCase):
+    def test_detect_backward_jump(self):
+        src = '''void f() {
+        retry:
+            do_work();
+            if (failed) goto retry;
+        }'''
+        issues = run_checks(src)
+        self.assertTrue(has_issue(issues, creview.Severity.MAINT, "前方"))
+
+    def test_forward_goto_safe(self):
+        src = '''void f() {
+            if (error) goto cleanup;
+            do_work();
+        cleanup:
+            free(ptr);
+        }'''
+        issues = run_checks(src)
+        self.assertFalse(has_issue(issues, keyword="前方"))
+
+
+class TestFixHint(unittest.TestCase):
+    def test_hint_present(self):
+        hint = creview.get_fix_hint("pにNULLチェックなし。malloc失敗時クラッシュ")
+        self.assertIn("if (ptr == NULL)", hint)
+
+    def test_hint_format_text(self):
+        issues = [
+            creview.Issue(creview.Severity.CRITICAL, "t.c", 1, "gets使用。バッファ長制限なし"),
+        ]
+        output = creview.format_text(issues, fix_hint=True)
+        self.assertIn("fgets", output)
+
+
+class TestListRules(unittest.TestCase):
+    def test_all_rules_defined(self):
+        # checksリストとRULE_DESCRIPTIONSが一致すること
+        self.assertIn("toctou", creview.RULE_DESCRIPTIONS)
+        self.assertIn("signal_unsafe", creview.RULE_DESCRIPTIONS)
+        self.assertIn("cast_truncation", creview.RULE_DESCRIPTIONS)
+        self.assertIn("bitfield_sign", creview.RULE_DESCRIPTIONS)
+        self.assertIn("vla", creview.RULE_DESCRIPTIONS)
+        self.assertIn("goto_misuse", creview.RULE_DESCRIPTIONS)
+        self.assertEqual(len(creview.RULE_DESCRIPTIONS), 33)
+
+
+class TestBaseline(unittest.TestCase):
+    def test_filter_known_issues(self):
+        # ベースラインに含まれる指摘は除外される
+        issues = [
+            creview.Issue(creview.Severity.CRITICAL, "t.c", 1, "テスト指摘"),
+            creview.Issue(creview.Severity.DESIGN, "t.c", 2, "新しい指摘"),
+        ]
+        baseline = [{"file": "t.c", "line": 1, "message": "テスト指摘"}]
+        baseline_set = set()
+        for bi in baseline:
+            baseline_set.add((bi["file"], bi["line"], bi["message"]))
+        filtered = [i for i in issues if (i.filepath, i.line, i.message) not in baseline_set]
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered[0].message, "新しい指摘")
+
+
 if __name__ == "__main__":
     unittest.main()
