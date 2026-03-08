@@ -503,7 +503,8 @@ class TestListRules(unittest.TestCase):
         self.assertIn("bitfield_sign", creview.RULE_DESCRIPTIONS)
         self.assertIn("vla", creview.RULE_DESCRIPTIONS)
         self.assertIn("goto_misuse", creview.RULE_DESCRIPTIONS)
-        self.assertEqual(len(creview.RULE_DESCRIPTIONS), 33)
+        self.assertIn("stack_usage", creview.RULE_DESCRIPTIONS)
+        self.assertEqual(len(creview.RULE_DESCRIPTIONS), 34)
 
 
 class TestBaseline(unittest.TestCase):
@@ -901,6 +902,171 @@ class TestSimilarFormatOutput(unittest.TestCase):
                                  "sprintf使用。出力バッファ長未検証でオーバーフロー可能")]
         output = creview.format_text(issues, similar_map=None)
         self.assertNotIn("類似箇所", output)
+
+
+class TestStackAnalysis(unittest.TestCase):
+    def _analyze(self, src):
+        """ヘルパー: ソースを解析してStackInfo一覧を返す"""
+        raw = src.split("\n")
+        cl = creview.strip_comments_and_strings(src)
+        return creview.analyze_file_stack("test.c", raw, cl)
+
+    def test_small_function(self):
+        """小さい関数のスタック推定"""
+        src = 'void f() {\n    int x;\n    char c;\n}\n'
+        infos = self._analyze(src)
+        self.assertEqual(len(infos), 1)
+        self.assertEqual(infos[0].func_name, "f")
+        # int(4) + char(1) = 5
+        self.assertEqual(infos[0].estimated_bytes, 5)
+
+    def test_large_array(self):
+        """大きな配列でスタック超過検出"""
+        src = 'void big() {\n    char buf[16384];\n}\n'
+        infos = self._analyze(src)
+        self.assertEqual(len(infos), 1)
+        self.assertEqual(infos[0].estimated_bytes, 16384)
+
+    def test_multiple_arrays(self):
+        """複数配列の合計"""
+        src = 'void f() {\n    int a[100];\n    double b[200];\n}\n'
+        infos = self._analyze(src)
+        self.assertEqual(len(infos), 1)
+        # int[100]=400, double[200]=1600
+        self.assertEqual(infos[0].estimated_bytes, 2000)
+
+    def test_2d_array(self):
+        """2次元配列"""
+        src = 'void f() {\n    int mat[10][20];\n}\n'
+        infos = self._analyze(src)
+        self.assertEqual(len(infos), 1)
+        # int[10][20] = 4 * 10 * 20 = 800
+        self.assertEqual(infos[0].estimated_bytes, 800)
+
+    def test_alloca_detection(self):
+        """alloca検出"""
+        src = 'void f() {\n    char *p = alloca(100);\n}\n'
+        infos = self._analyze(src)
+        self.assertEqual(len(infos), 1)
+        self.assertTrue(infos[0].has_alloca)
+
+    def test_vla_detection(self):
+        """VLA検出"""
+        src = 'void f(int n) {\n    char buf[n];\n}\n'
+        infos = self._analyze(src)
+        self.assertEqual(len(infos), 1)
+        self.assertTrue(infos[0].has_vla)
+
+    def test_recursive_detection(self):
+        """再帰検出"""
+        src = 'void f(int n) {\n    int buf[1024];\n    f(n - 1);\n}\n'
+        infos = self._analyze(src)
+        self.assertEqual(len(infos), 1)
+        self.assertTrue(infos[0].is_recursive)
+        self.assertEqual(infos[0].estimated_bytes, 4096)
+
+    def test_multiple_functions(self):
+        """複数関数の解析"""
+        src = ('void small() {\n    int x;\n}\n'
+               'void big() {\n    char buf[8192];\n}\n')
+        infos = self._analyze(src)
+        self.assertEqual(len(infos), 2)
+        names = {i.func_name for i in infos}
+        self.assertIn("small", names)
+        self.assertIn("big", names)
+
+    def test_pointer_not_counted_as_array(self):
+        """ポインタ変数は配列として大きく計上されない"""
+        src = 'void f() {\n    char *p;\n}\n'
+        infos = self._analyze(src)
+        self.assertEqual(len(infos), 1)
+        # ポインタは小さい (8以下)
+        self.assertTrue(infos[0].estimated_bytes <= 8)
+
+
+class TestCheckStackUsage(unittest.TestCase):
+    def test_exceeds_threshold(self):
+        """閾値超過で指摘"""
+        import tempfile
+        src = '#include <stdlib.h>\nvoid f() {\n    char buf[16384];\n}\n'
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.c', delete=False,
+                                          encoding='utf-8') as f:
+            f.write(src)
+            path = f.name
+        try:
+            ignore = creview.IgnoreConfig()
+            issues = creview.run_local_analysis(path, ignore,
+                                                 only_rules={"stack_usage"},
+                                                 stack_threshold=8192)
+            stack_issues = [i for i in issues if "スタック" in i.message]
+            self.assertTrue(len(stack_issues) > 0)
+            self.assertIn("16384", stack_issues[0].message)
+        finally:
+            os.unlink(path)
+
+    def test_under_threshold_no_issue(self):
+        """閾値以下は指摘なし"""
+        import tempfile
+        src = '#include <stdlib.h>\nvoid f() {\n    int x;\n}\n'
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.c', delete=False,
+                                          encoding='utf-8') as f:
+            f.write(src)
+            path = f.name
+        try:
+            ignore = creview.IgnoreConfig()
+            issues = creview.run_local_analysis(path, ignore,
+                                                 only_rules={"stack_usage"})
+            stack_issues = [i for i in issues if "スタック" in i.message]
+            self.assertEqual(len(stack_issues), 0)
+        finally:
+            os.unlink(path)
+
+    def test_alloca_flagged(self):
+        """alloca使用で指摘"""
+        import tempfile
+        src = '#include <stdlib.h>\nvoid f(int n) {\n    char *p = alloca(n);\n}\n'
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.c', delete=False,
+                                          encoding='utf-8') as f:
+            f.write(src)
+            path = f.name
+        try:
+            ignore = creview.IgnoreConfig()
+            issues = creview.run_local_analysis(path, ignore,
+                                                 only_rules={"stack_usage"})
+            alloca_issues = [i for i in issues if "alloca" in i.message]
+            self.assertTrue(len(alloca_issues) > 0)
+        finally:
+            os.unlink(path)
+
+
+class TestStackReport(unittest.TestCase):
+    def test_report_format(self):
+        """スタックレポートのフォーマット"""
+        infos = [
+            creview.StackInfo("big_func", 10, 16384,
+                              [("char buf[16384]", 16384)],
+                              False, False, False),
+            creview.StackInfo("small_func", 20, 64, [],
+                              False, False, False),
+        ]
+        report = creview.format_stack_report("test.c", infos)
+        self.assertIn("big_func", report)
+        self.assertIn("small_func", report)
+        self.assertIn("16,384", report)
+        self.assertIn("!!超過", report)
+        self.assertIn("スタック解析", report)
+
+    def test_report_with_flags(self):
+        """alloca/VLA/再帰フラグの表示"""
+        infos = [
+            creview.StackInfo("risky", 5, 4096,
+                              [("alloca()", -1)],
+                              True, True, True),
+        ]
+        report = creview.format_stack_report("test.c", infos)
+        self.assertIn("alloca", report)
+        self.assertIn("VLA", report)
+        self.assertIn("再帰", report)
 
 
 if __name__ == "__main__":

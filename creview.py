@@ -20,7 +20,7 @@ from fnmatch import fnmatch
 import subprocess
 
 # ─── バージョン / 定数 ────────────────────────────────
-VERSION = "0.11.0"
+VERSION = "0.12.0"
 IGNOREFILE = ".creviewignore"
 CONFIGFILE = "config.txt"
 MAX_CHUNK_BYTES = 80_000
@@ -1198,11 +1198,305 @@ def check_packed(fp, raw, cl, issues, ignore):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# スタックサイズ推定
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# 基本型サイズ (LP64 ABI想定)
+TYPE_SIZES = {
+    "char": 1, "signed char": 1, "unsigned char": 1,
+    "short": 2, "unsigned short": 2,
+    "int": 4, "unsigned int": 4, "unsigned": 4, "signed": 4,
+    "long": 8, "unsigned long": 8,
+    "long long": 8, "unsigned long long": 8,
+    "float": 4, "double": 8, "long double": 16,
+    "size_t": 8, "ssize_t": 8, "ptrdiff_t": 8,
+    "int8_t": 1, "uint8_t": 1,
+    "int16_t": 2, "uint16_t": 2,
+    "int32_t": 4, "uint32_t": 4,
+    "int64_t": 8, "uint64_t": 8,
+    "pid_t": 4, "off_t": 8, "time_t": 8,
+    "bool": 1, "_Bool": 1,
+}
+
+DEFAULT_STACK_THRESHOLD = 8192  # 8KB
+
+
+@dataclass
+class StackInfo:
+    func_name: str
+    line: int
+    estimated_bytes: int
+    details: List[Tuple[str, int]]   # (変数宣言, 推定サイズ)
+    has_alloca: bool
+    has_vla: bool
+    is_recursive: bool
+
+
+def _get_type_size(type_str: str) -> int:
+    """型名からサイズを推定"""
+    t = type_str.strip()
+    # ポインタ
+    if '*' in t:
+        return 8
+    # struct/union/enumは推定不能、デフォルト値
+    if t.startswith(("struct ", "union ", "enum ")):
+        return 0  # 不明
+    # 型修飾子を除去
+    for qual in ("const ", "volatile ", "static ", "register ", "restrict "):
+        t = t.replace(qual, "")
+    t = t.strip()
+    return TYPE_SIZES.get(t, 0)
+
+
+def _parse_array_size(size_expr: str) -> Optional[int]:
+    """配列サイズ式から定数値を推定"""
+    s = size_expr.strip()
+    # 単純な数値
+    try:
+        return int(s)
+    except ValueError:
+        pass
+    # 16進数
+    if s.startswith("0x") or s.startswith("0X"):
+        try:
+            return int(s, 16)
+        except ValueError:
+            pass
+    # 単純な乗算 (例: 4 * 1024)
+    m = re.match(r'(\d+)\s*\*\s*(\d+)$', s)
+    if m:
+        return int(m.group(1)) * int(m.group(2))
+    # sizeof(type) * N パターン
+    m = re.match(r'sizeof\s*\(\s*(\w+)\s*\)\s*\*\s*(\d+)$', s)
+    if m:
+        ts = _get_type_size(m.group(1))
+        if ts > 0:
+            return ts * int(m.group(2))
+    # 変数式 → VLAとして扱い、サイズ不明
+    return None
+
+
+def analyze_function_stack(func_name: str, func_start: int,
+                           body_lines: List[str], cl_lines: List[str]) -> StackInfo:
+    """関数本体のローカル変数からスタック使用量を推定"""
+    total = 0
+    details: List[Tuple[str, int]] = []
+    has_alloca = False
+    has_vla = False
+    is_recursive = False
+
+    # 型名パターン (ポインタ含む)
+    type_pat = (
+        r'(?:(?:const|volatile|static|register)\s+)*'
+        r'(?:(?:unsigned|signed)\s+)?'
+        r'(?:struct\s+\w+|union\s+\w+|enum\s+\w+|'
+        r'char|short|int|long\s+long|long|float|double|'
+        r'size_t|ssize_t|ptrdiff_t|'
+        r'(?:u?int(?:8|16|32|64)_t)|'
+        r'pid_t|off_t|time_t|bool|_Bool)'
+        r'(?:\s*\*)*'
+    )
+
+    # 配列宣言: type var[SIZE]  or  type var[SIZE1][SIZE2]
+    arr_re = re.compile(
+        rf'({type_pat})\s+(\w+)\s*'
+        r'\[\s*([^\]]*)\s*\]'
+        r'(?:\s*\[\s*([^\]]*)\s*\])?'
+        r'\s*[;=]'
+    )
+
+    # スカラ変数宣言: type var;  or  type var = ...;
+    scalar_re = re.compile(
+        rf'({type_pat})\s+(\w+)\s*[;=,]'
+    )
+
+    # alloca検出
+    alloca_re = re.compile(r'\balloca\s*\(')
+
+    # 自己再帰検出
+    call_re = re.compile(rf'\b{re.escape(func_name)}\s*\(')
+
+    for i, line in enumerate(cl_lines):
+        if i == 0:
+            continue  # 関数定義行はスキップ (自己再帰の誤検出防止)
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        # alloca
+        if alloca_re.search(stripped):
+            has_alloca = True
+            details.append(("alloca()", -1))
+
+        # 自己再帰呼び出し
+        if call_re.search(stripped):
+            is_recursive = True
+
+        # 配列宣言
+        m = arr_re.search(stripped)
+        if m:
+            type_str = m.group(1)
+            var_name = m.group(2)
+            size1_str = m.group(3)
+            size2_str = m.group(4)
+
+            elem_size = _get_type_size(type_str)
+            if elem_size == 0:
+                elem_size = 4  # 不明型はint相当で推定
+
+            size1 = _parse_array_size(size1_str)
+            if size1 is None:
+                has_vla = True
+                details.append((f"{type_str} {var_name}[{size1_str}]", -1))
+                continue
+
+            arr_bytes = elem_size * size1
+            if size2_str is not None:
+                size2 = _parse_array_size(size2_str)
+                if size2 is not None:
+                    arr_bytes *= size2
+                else:
+                    has_vla = True
+
+            total += arr_bytes
+            decl = f"{type_str} {var_name}[{size1_str}]"
+            if size2_str:
+                decl += f"[{size2_str}]"
+            details.append((decl, arr_bytes))
+            continue
+
+        # スカラ変数 (配列でないもの)
+        m = scalar_re.search(stripped)
+        if m:
+            type_str = m.group(1)
+            sz = _get_type_size(type_str)
+            if sz > 0:
+                total += sz
+                # 小さいスカラは集約して表示しないが計上はする
+
+    return StackInfo(
+        func_name=func_name,
+        line=func_start + 1,
+        estimated_bytes=total,
+        details=[d for d in details if d[1] != 0],  # 不明(0)は除外
+        has_alloca=has_alloca,
+        has_vla=has_vla,
+        is_recursive=is_recursive,
+    )
+
+
+def analyze_file_stack(filepath: str, raw: List[str],
+                       cl: List[str]) -> List[StackInfo]:
+    """ファイル内の全関数のスタック使用量を推定"""
+    func_re = re.compile(r'^(\w[\w\s\*]*?)\s+(\w+)\s*\(')
+    results: List[StackInfo] = []
+
+    i = 0
+    while i < len(cl):
+        fm = func_re.match(cl[i])
+        if fm and '{' in cl[i]:
+            func_name = fm.group(2)
+            # static/inline等のキーワードを除外
+            if func_name in ("if", "while", "for", "switch", "return"):
+                i += 1
+                continue
+
+            func_start = i
+            brace = 0
+            func_end = i
+            for j in range(i, len(cl)):
+                brace += cl[j].count('{') - cl[j].count('}')
+                if brace <= 0 and j > i:
+                    func_end = j
+                    break
+
+            body_raw = raw[func_start:func_end + 1]
+            body_cl = cl[func_start:func_end + 1]
+            info = analyze_function_stack(func_name, func_start,
+                                          body_raw, body_cl)
+            results.append(info)
+            i = func_end + 1
+        else:
+            i += 1
+
+    return results
+
+
+def check_stack_usage(fp, raw, cl, issues, threshold=DEFAULT_STACK_THRESHOLD):
+    """スタック使用量が閾値を超える関数を指摘"""
+    stack_infos = analyze_file_stack(fp, raw, cl)
+    for info in stack_infos:
+        warnings = []
+
+        if info.estimated_bytes > threshold:
+            warnings.append(
+                f"関数{info.func_name}: 推定スタック使用{info.estimated_bytes}バイト"
+                f"(閾値{threshold}超過)。スタックオーバーフローの危険")
+
+        if info.has_alloca:
+            warnings.append(
+                f"関数{info.func_name}: alloca()使用。"
+                f"実行時スタック量不定、オーバーフローの危険")
+
+        if info.estimated_bytes > threshold // 2 and info.is_recursive:
+            warnings.append(
+                f"関数{info.func_name}: 再帰関数でスタック使用{info.estimated_bytes}バイト。"
+                f"再帰深度次第でスタック枯渇")
+
+        for msg in warnings:
+            issues.append(Issue(Severity.CRITICAL, fp, info.line, msg))
+
+
+def format_stack_report(filepath: str, stack_infos: List[StackInfo]) -> str:
+    """--stack用: 関数別スタック使用量レポート"""
+    if not stack_infos:
+        return f"{filepath}: 関数なし\n"
+
+    lines = [f"── スタック解析: {filepath} ──"]
+    lines.append(f"{'関数名':<30} {'推定バイト':>10}  {'備考'}")
+    lines.append("─" * 65)
+
+    # サイズ降順
+    sorted_infos = sorted(stack_infos, key=lambda x: x.estimated_bytes,
+                          reverse=True)
+    for info in sorted_infos:
+        notes = []
+        if info.has_alloca:
+            notes.append("alloca")
+        if info.has_vla:
+            notes.append("VLA")
+        if info.is_recursive:
+            notes.append("再帰")
+        if info.estimated_bytes > DEFAULT_STACK_THRESHOLD:
+            notes.append("!!超過")
+
+        note_str = ", ".join(notes) if notes else "-"
+        size_str = f"{info.estimated_bytes:,}" if info.estimated_bytes >= 0 else "不定"
+        lines.append(f"{info.func_name:<30} {size_str:>10}  {note_str}")
+
+        # 大きな変数の内訳
+        big_details = [(d, s) for d, s in info.details
+                       if s > 256 or s == -1]
+        for decl, sz in big_details:
+            if sz == -1:
+                lines.append(f"  └─ {decl}  (サイズ不定)")
+            else:
+                lines.append(f"  └─ {decl}  ({sz:,}バイト)")
+
+    total = sum(i.estimated_bytes for i in stack_infos)
+    lines.append("─" * 65)
+    lines.append(f"関数数: {len(stack_infos)}  合計推定: {total:,}バイト")
+    lines.append("")
+    return "\n".join(lines)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Phase 1: ローカル静的解析エンジン
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def run_local_analysis(filepath: str, ignore: IgnoreConfig,
-                       only_rules: Optional[Set[str]] = None) -> List[Issue]:
+                       only_rules: Optional[Set[str]] = None,
+                       stack_threshold: int = DEFAULT_STACK_THRESHOLD) -> List[Issue]:
     issues: List[Issue] = []
     try:
         with open(filepath, "r", encoding="utf-8", errors="replace") as f:
@@ -1250,6 +1544,8 @@ def run_local_analysis(filepath: str, ignore: IgnoreConfig,
         ("bitfield_sign",       lambda: check_bitfield_sign(filepath, raw, cl, issues)),
         ("vla",                 lambda: check_vla(filepath, raw, cl, issues)),
         ("goto_misuse",         lambda: check_goto_misuse(filepath, raw, cl, issues)),
+        ("stack_usage",         lambda: check_stack_usage(filepath, raw, cl, issues,
+                                                            threshold=stack_threshold)),
     ]
     for rule_name, check_fn in checks:
         if rule_name in off:
@@ -1512,6 +1808,7 @@ RULE_DESCRIPTIONS = {
     "bitfield_sign":       "ビットフィールド符号未指定",
     "vla":                 "可変長配列(VLA)使用",
     "goto_misuse":         "goto前方ジャンプ",
+    "stack_usage":         "スタック使用量超過/alloca検出",
 }
 
 # --fix-hint用: メッセージキーワード → 修正ヒント
@@ -1546,6 +1843,9 @@ FIX_HINTS = {
     "defaultなし": "→ default: ケースを追加してassert/ログ出力",
     "自己再帰": "→ depth引数を追加し上限チェック",
     "無限ループ": "→ break/return条件を追加、またはコメントで意図を明示",
+    "推定スタック使用": "→ 大きな配列はmalloc/freeに変更",
+    "alloca()使用": "→ malloc/freeに置換、またはサイズ上限チェック追加",
+    "再帰関数でスタック使用": "→ 大きなローカル変数をmallocに変更、または再帰をループ化",
 }
 
 
@@ -2171,7 +2471,7 @@ PRESETS = {
         "description": "メモリ関連バグ検出",
         "rules": {"null_deref", "double_free", "use_after_free", "fd_leak",
                   "resource_leak", "memcpy_no_null", "integer_overflow",
-                  "buffer_overrun"},
+                  "buffer_overrun", "stack_usage"},
     },
     "security": {
         "description": "セキュリティ脆弱性検出",
@@ -2528,6 +2828,11 @@ def main():
                         help="各指摘に最小修正・推奨修正のコード例を表示")
     parser.add_argument("--similar", action="store_true",
                         help="各指摘の類似パターンを全対象ファイルから水平展開")
+    parser.add_argument("--stack", action="store_true",
+                        help="関数別スタック使用量レポートを表示")
+    parser.add_argument("--stack-threshold", type=int,
+                        default=DEFAULT_STACK_THRESHOLD,
+                        help=f"スタック超過閾値バイト(デフォルト{DEFAULT_STACK_THRESHOLD})")
     parser.add_argument("--baseline",
                         help="ベースラインJSONファイル。新規指摘のみ表示")
     parser.add_argument("--exit-code",
@@ -2636,7 +2941,8 @@ def main():
             continue
 
         # Phase 1: ローカル静的解析
-        local_issues = run_local_analysis(fpath, ignore, only_rules=only_rules)
+        local_issues = run_local_analysis(fpath, ignore, only_rules=only_rules,
+                                          stack_threshold=args.stack_threshold)
 
         # --diff: 変更行のみにフィルタ
         if args.diff:
@@ -2689,6 +2995,19 @@ def main():
                     print(f"── ローカル解析: {fpath} ──")
                     print(format_text(local_issues, fix_hint=use_hint,
                                        fix=use_fix, similar_map=sim_map))
+
+        # --stack: 関数別スタック使用量レポート
+        if args.stack:
+            try:
+                with open(fpath, "r", encoding="utf-8", errors="replace") as sf:
+                    stack_src = sf.read()
+                stack_raw = stack_src.split("\n")
+                stack_cl = strip_comments_and_strings(stack_src)
+                stack_infos = analyze_file_stack(fpath, stack_raw, stack_cl)
+                if stack_infos:
+                    print(format_stack_report(fpath, stack_infos))
+            except OSError:
+                pass
 
         if any(i.severity == Severity.CRITICAL for i in local_issues):
             has_critical = True
