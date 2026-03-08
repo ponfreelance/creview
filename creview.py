@@ -20,7 +20,7 @@ from fnmatch import fnmatch
 import subprocess
 
 # ─── バージョン / 定数 ────────────────────────────────
-VERSION = "0.14.0"
+VERSION = "0.14.1"
 IGNOREFILE = ".creviewignore"
 CONFIGFILE = "config.txt"
 MAX_CHUNK_BYTES = 80_000
