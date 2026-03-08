@@ -793,5 +793,115 @@ class TestFixFormatText(unittest.TestCase):
             os.unlink(path)
 
 
+class TestExtractSimilarPattern(unittest.TestCase):
+    def test_malloc_pattern(self):
+        """malloc NULLチェック漏れの類似パターン抽出"""
+        msg = "pにNULLチェックなし。malloc/calloc/realloc失敗時クラッシュ"
+        pat = creview._extract_similar_pattern(msg, "char *p = malloc(100);")
+        self.assertIsNotNone(pat)
+        import re
+        self.assertTrue(re.search(pat, "x = malloc(50);"))
+        self.assertTrue(re.search(pat, "buf = calloc(10, 4);"))
+
+    def test_sprintf_pattern(self):
+        """sprintf類似パターン抽出"""
+        msg = "sprintf使用。出力バッファ長未検証でオーバーフロー可能"
+        pat = creview._extract_similar_pattern(msg, 'sprintf(buf, "%d", x);')
+        self.assertIsNotNone(pat)
+        import re
+        self.assertTrue(re.search(pat, 'sprintf(out, "%s", name);'))
+
+    def test_unknown_returns_none(self):
+        """不明な指摘にはNone"""
+        pat = creview._extract_similar_pattern("未知の指摘", "x = 1;")
+        self.assertIsNone(pat)
+
+
+class TestFindSimilarIssues(unittest.TestCase):
+    def test_find_similar_across_files(self):
+        """複数ファイルから類似パターンを検出"""
+        import tempfile
+        # ファイル1: mallocあり (指摘元)
+        src1 = '#include <stdlib.h>\nvoid f() {\n    char *p = malloc(100);\n}\n'
+        # ファイル2: 別のmalloc (類似箇所として検出されるべき)
+        src2 = '#include <stdlib.h>\nvoid g() {\n    int *q = malloc(sizeof(int));\n}\n'
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.c', delete=False,
+                                          encoding='utf-8') as f1:
+            f1.write(src1)
+            path1 = f1.name
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.c', delete=False,
+                                          encoding='utf-8') as f2:
+            f2.write(src2)
+            path2 = f2.name
+        try:
+            issue = creview.Issue(creview.Severity.CRITICAL, path1, 3,
+                                   "pにNULLチェックなし。malloc/calloc/realloc失敗時クラッシュ")
+            cache = {}
+            similar = creview.find_similar_issues(issue, [path1, path2], cache)
+            # path2の3行目にmallocがあるので検出されるべき
+            self.assertTrue(len(similar) > 0)
+            found_path2 = any(s.filepath == path2 for s in similar)
+            self.assertTrue(found_path2)
+            # 自分自身(path1:3)は含まれないこと
+            self_found = any(s.filepath == path1 and s.line == 3 for s in similar)
+            self.assertFalse(self_found)
+        finally:
+            os.unlink(path1)
+            os.unlink(path2)
+
+    def test_no_similar_for_unknown(self):
+        """パターン不明の指摘は類似0件"""
+        import tempfile
+        src = 'int main() { return 0; }\n'
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.c', delete=False,
+                                          encoding='utf-8') as f:
+            f.write(src)
+            path = f.name
+        try:
+            issue = creview.Issue(creview.Severity.MAINT, path, 1, "不明な指摘")
+            cache = {}
+            similar = creview.find_similar_issues(issue, [path], cache)
+            self.assertEqual(len(similar), 0)
+        finally:
+            os.unlink(path)
+
+
+class TestSimilarFormatOutput(unittest.TestCase):
+    def test_similar_in_text_output(self):
+        """--similar指定時にtext出力に類似箇所が含まれる"""
+        issues = [creview.Issue(creview.Severity.CRITICAL, "a.c", 5,
+                                 "sprintf使用。出力バッファ長未検証でオーバーフロー可能")]
+        sim_map = {
+            ("a.c", 5): [
+                creview.SimilarLocation("b.c", 10, 'sprintf(buf, "%d", n);'),
+                creview.SimilarLocation("c.c", 20, 'sprintf(out, "%s", s);'),
+            ]
+        }
+        output = creview.format_text(issues, similar_map=sim_map)
+        self.assertIn("[類似箇所] 2件", output)
+        self.assertIn("b.c:10", output)
+        self.assertIn("c.c:20", output)
+
+    def test_similar_in_markdown_output(self):
+        """--similar指定時にmarkdown出力に類似箇所が含まれる"""
+        issues = [creview.Issue(creview.Severity.CRITICAL, "a.c", 5,
+                                 "sprintf使用。出力バッファ長未検証でオーバーフロー可能")]
+        sim_map = {
+            ("a.c", 5): [
+                creview.SimilarLocation("b.c", 10, 'sprintf(buf, "%d", n);'),
+            ]
+        }
+        output = creview.format_markdown(issues, "a.c", similar_map=sim_map)
+        self.assertIn("類似箇所", output)
+        self.assertIn("`b.c:10`", output)
+
+    def test_no_similar_section_when_none(self):
+        """similar_map=Noneなら類似箇所セクションなし"""
+        issues = [creview.Issue(creview.Severity.CRITICAL, "a.c", 5,
+                                 "sprintf使用。出力バッファ長未検証でオーバーフロー可能")]
+        output = creview.format_text(issues, similar_map=None)
+        self.assertNotIn("類似箇所", output)
+
+
 if __name__ == "__main__":
     unittest.main()

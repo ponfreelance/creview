@@ -20,7 +20,7 @@ from fnmatch import fnmatch
 import subprocess
 
 # ─── バージョン / 定数 ────────────────────────────────
-VERSION = "0.10.0"
+VERSION = "0.11.0"
 IGNOREFILE = ".creviewignore"
 CONFIGFILE = "config.txt"
 MAX_CHUNK_BYTES = 80_000
@@ -2015,6 +2015,156 @@ def generate_fix(message: str, source_line: str) -> Optional[FixSuggestion]:
     return None
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# --similar 水平展開 (類似パターン検索)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@dataclass
+class SimilarLocation:
+    filepath: str
+    line: int
+    source: str  # 該当行のソース
+
+
+def _extract_similar_pattern(message: str, source_line: str) -> Optional[str]:
+    """指摘メッセージとソース行から類似パターン検索用の正規表現を生成"""
+    line = source_line.strip()
+
+    # malloc/calloc/realloc NULLチェック漏れ → 同じalloc呼び出しパターン
+    if "NULLチェックなし" in message and ("malloc" in message or "calloc" in message or "realloc" in message):
+        return r'\b\w+\s*=\s*(?:malloc|calloc|realloc)\s*\('
+
+    # gets使用
+    if "gets使用" in message:
+        return r'\bgets\s*\('
+
+    # sprintf使用
+    if "sprintf使用" in message:
+        return r'\bsprintf\s*\('
+
+    # strcpy使用
+    if "strcpy使用" in message:
+        return r'\bstrcpy\s*\('
+
+    # strcat使用
+    if "strcat使用" in message:
+        return r'\bstrcat\s*\('
+
+    # NULL未検証 (memcpy等)
+    if "NULL未検証" in message:
+        return r'\b(?:memcpy|memmove|memset)\s*\('
+
+    # 二重free
+    if "二重free" in message:
+        return r'\bfree\s*\('
+
+    # use-after-free
+    if "use-after-free" in message:
+        return r'\bfree\s*\('
+
+    # 書式文字列脆弱性
+    if "書式文字列" in message:
+        return r'\b(?:printf|fprintf|syslog)\s*\(\s*\w+\s*\)'
+
+    # 整数オーバーフロー
+    if "オーバーフロー未検証" in message:
+        return r'\bmalloc\s*\(\s*\w+\s*\*\s*\w+'
+
+    # sizeof(ポインタ)
+    if "sizeof" in message and "ポインタ" in message:
+        return r'\bsizeof\s*\(\s*\w+\s*\)'
+
+    # fclose漏れ
+    if "fclose" in message and "リーク" in message:
+        return r'\bfopen\s*\('
+
+    # リソースリーク (open/socket)
+    if "リソースリーク" in message or "close()なし" in message:
+        return r'\b(?:open|socket)\s*\('
+
+    # fall-through
+    if "fall-through" in message:
+        return r'\bcase\s+\w+'
+
+    # バッファオーバーラン
+    if "バッファオーバーラン" in message:
+        return r'\b(?:strncpy|memcpy)\s*\('
+
+    # デッドロック (mutex)
+    if "デッドロック" in message:
+        return r'\bpthread_mutex_lock\s*\('
+
+    # TOCTOU
+    if "TOCTOU" in message:
+        return r'\baccess\s*\('
+
+    # async-signal-unsafe
+    if "async-signal-unsafe" in message:
+        return r'\bsignal\s*\('
+
+    # 未初期化変数
+    if "未初期化変数" in message:
+        return r'\b(?:int|char|short|long|float|double|size_t|unsigned)\s+\w+\s*;'
+
+    # 可変長配列
+    if "可変長配列" in message:
+        return r'\b\w+\s+\w+\s*\[\s*[a-zA-Z_]\w*\s*\]'
+
+    # snprintf戻り値
+    if "snprintf" in message and "戻り値" in message:
+        return r'\bsnprintf\s*\('
+
+    # マジックナンバー
+    if "マジックナンバー" in message:
+        return r'\b(?:if|while|for|case|return)\s*.*\b\d{2,}\b'
+
+    # signed/unsigned比較
+    if "signed" in message and "unsigned" in message:
+        return r'(?:signed|unsigned)\s+\w+'
+
+    # 自己再帰
+    if "自己再帰" in message:
+        m = re.search(r'(\w+)が自己再帰', message)
+        if m:
+            func = m.group(1)
+            return rf'\b{re.escape(func)}\s*\('
+
+    return None
+
+
+def find_similar_issues(issue: Issue, all_files: List[str],
+                        file_cache: Dict[str, List[str]]) -> List[SimilarLocation]:
+    """指摘と同じパターンが他のファイル・行にないか検索"""
+    src_line = _read_source_line(issue.filepath, issue.line)
+    pattern_str = _extract_similar_pattern(issue.message, src_line)
+    if pattern_str is None:
+        return []
+
+    pattern = re.compile(pattern_str)
+    results: List[SimilarLocation] = []
+
+    for fpath in all_files:
+        if fpath not in file_cache:
+            try:
+                with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                    source = f.read()
+                file_cache[fpath] = strip_comments_and_strings(source)
+            except OSError:
+                continue
+
+        cl = file_cache[fpath]
+        for i, line in enumerate(cl):
+            line_num = i + 1
+            # 自分自身の指摘行はスキップ
+            if fpath == issue.filepath and line_num == issue.line:
+                continue
+            if pattern.search(line):
+                raw_line = _read_source_line(fpath, line_num)
+                results.append(SimilarLocation(fpath, line_num, raw_line.strip()))
+
+    return results
+
+
 # --preset用: プリセットグループ定義
 PRESETS = {
     "memory": {
@@ -2184,7 +2334,8 @@ def _read_source_line(filepath: str, line_num: int) -> str:
 
 
 def format_text(issues: List[Issue], fix_hint: bool = False,
-                fix: bool = False) -> str:
+                fix: bool = False,
+                similar_map: Optional[Dict] = None) -> str:
     if not issues:
         return "重大なし\n設計不明なし\n保守危険なし"
     lines = []
@@ -2206,12 +2357,20 @@ def format_text(issues: List[Issue], fix_hint: bool = False,
                 lines.append("  [推奨修正]")
                 for sl in suggestion.recommended.split("\n"):
                     lines.append(f"    {sl}")
+        if similar_map is not None:
+            key = (iss.filepath, iss.line)
+            similar = similar_map.get(key, [])
+            if similar:
+                lines.append(f"  [類似箇所] {len(similar)}件")
+                for loc in similar:
+                    lines.append(f"    {loc.filepath}:{loc.line}  {loc.source}")
         lines.append("")
     return "\n".join(lines)
 
 
 def format_markdown(issues: List[Issue], filepath: str,
-                     fix_hint: bool = False, fix: bool = False) -> str:
+                     fix_hint: bool = False, fix: bool = False,
+                     similar_map: Optional[Dict] = None) -> str:
     """Markdown形式で指摘を出力"""
     lines = [f"## {filepath}\n"]
     if not issues:
@@ -2243,6 +2402,13 @@ def format_markdown(issues: List[Issue], filepath: str,
                     lines.append(f"    ```c")
                     lines.append(f"    {suggestion.recommended}")
                     lines.append(f"    ```")
+            if similar_map is not None:
+                key = (iss.filepath, iss.line)
+                similar = similar_map.get(key, [])
+                if similar:
+                    lines.append(f"  - **類似箇所** ({len(similar)}件):")
+                    for loc in similar:
+                        lines.append(f"    - `{loc.filepath}:{loc.line}` {loc.source}")
         lines.append("")
     return "\n".join(lines)
 
@@ -2360,6 +2526,8 @@ def main():
                         help="各指摘に修正ヒントを付与")
     parser.add_argument("--fix", action="store_true",
                         help="各指摘に最小修正・推奨修正のコード例を表示")
+    parser.add_argument("--similar", action="store_true",
+                        help="各指摘の類似パターンを全対象ファイルから水平展開")
     parser.add_argument("--baseline",
                         help="ベースラインJSONファイル。新規指摘のみ表示")
     parser.add_argument("--exit-code",
@@ -2436,6 +2604,7 @@ def main():
     has_design = False
     has_maint = False
     sarif_issues: Dict[str, List[Issue]] = {}  # SARIF用に全ファイル蓄積
+    similar_cache: Dict[str, List[str]] = {}   # --similar用: ファイルパス→cleaned lines
     # --severity フィルタ用マッピング
     severity_filter = None
     if args.severity:
@@ -2503,14 +2672,23 @@ def main():
         else:
             use_hint = args.fix_hint
             use_fix = args.fix
+            sim_map = None
+            if args.similar and local_issues:
+                sim_map = {}
+                for iss in local_issues:
+                    similar = find_similar_issues(iss, files, similar_cache)
+                    if similar:
+                        sim_map[(iss.filepath, iss.line)] = similar
             if args.format == "json":
                 print(format_json_v2(local_issues, fpath))
             elif args.format == "markdown":
-                print(format_markdown(local_issues, fpath, fix_hint=use_hint, fix=use_fix))
+                print(format_markdown(local_issues, fpath, fix_hint=use_hint,
+                                       fix=use_fix, similar_map=sim_map))
             else:
                 if local_issues:
                     print(f"── ローカル解析: {fpath} ──")
-                    print(format_text(local_issues, fix_hint=use_hint, fix=use_fix))
+                    print(format_text(local_issues, fix_hint=use_hint,
+                                       fix=use_fix, similar_map=sim_map))
 
         if any(i.severity == Severity.CRITICAL for i in local_issues):
             has_critical = True
