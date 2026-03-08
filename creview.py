@@ -1274,7 +1274,12 @@ def _get_obj_func_sizes(filepath: str) -> Optional[Dict[str, int]]:
             for _, fname, size, is_user in all_symbols:
                 if is_user:
                     sizes[fname] = size
-            return sizes if sizes else None
+            # 全関数が同一サイズ=アライメント由来(Windows COFF等)→信頼できない
+            unique_sizes = set(sizes.values())
+            if len(sizes) > 1 and len(unique_sizes) == 1:
+                has_size_col = False  # アドレス差方式にフォールバック
+            else:
+                return sizes if sizes else None
         # サイズ列がない場合: 全シンボルをアドレス順ソートし隣接差から推定
         all_symbols.sort(key=lambda s: s[0])
         reliable: Dict[str, int] = {}
