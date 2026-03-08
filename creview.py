@@ -1274,10 +1274,10 @@ def _get_obj_func_sizes(filepath: str) -> Optional[Dict[str, int]]:
             for _, fname, size, is_user in all_symbols:
                 if is_user:
                     sizes[fname] = size
-            # 全関数が同一サイズ=アライメント由来(Windows COFF等)→信頼できない
-            # アドレスもアライメントされるためアドレス差方式も不可→None返却
+            # サイズの妥当性検証: 複数関数が全て同一サイズ=アライメント由来
+            # 単一関数=検証不能 → いずれもソース解析にフォールバック
             unique_sizes = set(sizes.values())
-            if len(sizes) > 1 and len(unique_sizes) == 1:
+            if len(unique_sizes) <= 1:
                 return None
             else:
                 return sizes if sizes else None
