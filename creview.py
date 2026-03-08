@@ -1198,7 +1198,7 @@ def check_packed(fp, raw, cl, issues, ignore):
 
 
 def _get_obj_func_sizes(filepath: str) -> Optional[Dict[str, int]]:
-    """Cソースをgcc -cでコンパイルし、nm -Sで関数ごとのオブジェクトサイズを取得。
+    """Cソースをgcc -cでコンパイルし、nmで関数ごとのオブジェクトサイズを取得。
     コンパイル失敗時はNoneを返す。"""
     import tempfile
     import shutil
@@ -1218,24 +1218,71 @@ def _get_obj_func_sizes(filepath: str) -> Optional[Dict[str, int]]:
             capture_output=True, timeout=30)
         if result.returncode != 0:
             return None
-        # nm -S: シンボルサイズ表示, -t d: 10進数
+        # まずGNU nm -S を試行（Linux: サイズ列あり）
         nm_result = subprocess.run(
             ["nm", "-S", "--defined-only", obj_path],
             capture_output=True, text=True, timeout=10)
         if nm_result.returncode != 0:
-            return None
-        sizes: Dict[str, int] = {}
-        # nm -S 出力: "addr size type name"
-        # 例: "0000000000000000 000000000000000b T func_name"
+            # macOS等GNU nm非対応: --defined-only なしで再試行
+            nm_result = subprocess.run(
+                ["nm", "-n", obj_path],
+                capture_output=True, text=True, timeout=10)
+            if nm_result.returncode != 0:
+                return None
+        # シンボル解析: アドレス順ソートして隣接アドレス差からサイズ計算
+        # GNU nm -S: "addr size type name" (4列)
+        # macOS/BSD nm: "addr type name" (3列, サイズなし)
+        symbols = []  # [(addr, type, name)]
+        has_size_col = False
         for line in nm_result.stdout.splitlines():
             parts = line.split()
             if len(parts) >= 4 and parts[2] in ('T', 't'):
+                # GNU nm -S 形式: addr size type name
                 fname = parts[3]
+                # macOS: シンボル名の先頭 _ を除去
+                if fname.startswith('_'):
+                    fname = fname[1:]
                 try:
+                    addr = int(parts[0], 16)
                     size = int(parts[1], 16)
-                    sizes[fname] = size
+                    if size > 0:
+                        has_size_col = True
+                    symbols.append((addr, fname, size))
                 except ValueError:
                     pass
+            elif len(parts) >= 3 and parts[1] in ('T', 't'):
+                # BSD nm形式: addr type name
+                fname = parts[2]
+                if fname.startswith('_'):
+                    fname = fname[1:]
+                # コンパイラ内部ラベル(ltmp等)を除外
+                if fname.startswith('ltmp'):
+                    continue
+                try:
+                    addr = int(parts[0], 16)
+                    symbols.append((addr, fname, 0))
+                except ValueError:
+                    pass
+        if not symbols:
+            return None
+        # GNU nmでサイズ列が有効ならそのまま使用
+        if has_size_col:
+            sizes: Dict[str, int] = {}
+            for _, fname, size in symbols:
+                # コンパイラ内部ラベルを除外
+                if not fname.startswith('ltmp'):
+                    sizes[fname] = size
+            return sizes if sizes else None
+        # サイズ列がない場合: アドレス順でソートし隣接差から推定
+        symbols.sort(key=lambda s: s[0])
+        sizes = {}
+        for idx, (addr, fname, _) in enumerate(symbols):
+            if idx + 1 < len(symbols):
+                next_addr = symbols[idx + 1][0]
+                sizes[fname] = next_addr - addr
+            else:
+                # 最後のシンボル: サイズ不明→大きめに見積もる(検出回避)
+                sizes[fname] = 100
         return sizes if sizes else None
     except (OSError, subprocess.TimeoutExpired):
         return None
