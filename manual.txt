@@ -1,5 +1,5 @@
 ============================================
-C設計レビューAI  CReview v0.4.0
+C設計レビューAI  CReview v0.6.0
 ============================================
 
 
@@ -46,13 +46,24 @@ C設計レビューAI  CReview v0.4.0
   creview --local-only main.c
 
 APIキー無しでも使えます。
-ローカル静的解析14パターンのみ実行。
+ローカル静的解析21パターンのみ実行。
 
 
-■ JSON出力
+■ 差分モード（変更行のみレビュー）
 --------------------------------------------
 
-  creview --format json main.c
+  creview --diff --local-only src/
+
+git diffの変更行に該当する指摘のみ出力。
+PR前の差分チェックに最適。
+
+
+■ 出力形式
+--------------------------------------------
+
+  creview --format text main.c     テキスト（デフォルト）
+  creview --format json main.c     JSON
+  creview --format markdown main.c Markdown（レポート向け）
 
 
 ■ 出力の見方
@@ -68,6 +79,37 @@ APIキー無しでも使えます。
   将来バグ化可能。
 
 
+■ ローカル静的解析パターン一覧（21種）
+--------------------------------------------
+
+  [重大]
+  1.  malloc/calloc/realloc NULLチェック漏れ
+  2.  gets/sprintf/strcpy/strcat 使用
+  3.  memcpy/memmove/memset NULLポインタ未検証
+  4.  外部入力の配列添字バウンドチェック漏れ
+  5.  二重free
+  6.  sizeof(ポインタ)
+  7.  fopen/fclose リーク
+  8.  フォーマット文字列脆弱性 (printf変数直接)
+  9.  use-after-free (free後参照)
+  10. 未初期化変数使用
+  11. 整数オーバーフロー (malloc乗算)
+  12. open/socket/pipe リソースリーク
+
+  [設計不明]
+  13. return値と空returnの混在
+  14. switch case fall-through
+  15. マクロ引数の括弧未保護
+  16. volatile変数の非アトミック操作
+  17. packed構造体のアラインメント問題
+  18. signed/unsigned混合比較
+
+  [保守危険]
+  19. グローバル変数の関数内直接更新
+  20. マジックナンバー
+  21. snprintf戻り値無視
+
+
 ■ 警告抑制 .creviewignore
 --------------------------------------------
 
@@ -76,10 +118,31 @@ APIキー無しでも使えます。
   GLOBAL_OK      グローバル変数警告を抑制
   MACRO_ALLOW    マクロ警告を抑制
   MAGIC_OK       マジックナンバー警告を抑制
-  VOLATILE_OK    volatile変数の非アトミック操作警告を抑制
+  VOLATILE_OK    volatile非アトミック操作警告を抑制
   PACKED_OK      packed構造体警告を抑制
 
   # 以降はコメント
+
+
+■ ファイル除外 (EXCLUDE)
+--------------------------------------------
+
+.creviewignore に EXCLUDE パターンを記述：
+
+  EXCLUDE generated_*.c
+  EXCLUDE test_*.c
+  EXCLUDE vendor/*
+
+ファイル名またはパスのglob一致で除外。
+
+
+■ 行単位の抑制 (NOCHECK)
+--------------------------------------------
+
+ソースコード中のコメントに NOCHECK を書くと
+その行の指摘を全て抑制：
+
+  char *p = malloc(100);  // NOCHECK
 
 
 ■ 注意事項
@@ -98,7 +161,7 @@ APIキー無しでも使えます。
 
 1. 実装前    creview --spec spec.txt
 2. 実装後    creview src/
-3. PR前      creview --local-only src/
+3. PR前      creview --diff --local-only src/
 
 
 ■ 終了コード

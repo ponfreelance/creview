@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-creview v0.5.0 - C言語設計レビュー専用CLI
+creview v0.6.0 - C言語設計レビュー専用CLI
 指摘専用。コード生成・修正案・改善案 一切なし。
 ローカル静的解析 + Claude API深層レビュー 二段構成。
 """
@@ -16,9 +16,11 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import List, Dict, Set, Optional, Tuple
 from pathlib import Path
+from fnmatch import fnmatch
+import subprocess
 
 # ─── バージョン / 定数 ────────────────────────────────
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 IGNOREFILE = ".creviewignore"
 CONFIGFILE = "config.txt"
 MAX_CHUNK_BYTES = 80_000
@@ -120,6 +122,11 @@ class IgnoreConfig:
     volatile_ok: bool = False
     packed_ok: bool = False
     magic_ok: bool = False
+    exclude_patterns: List[str] = None
+
+    def __post_init__(self):
+        if self.exclude_patterns is None:
+            self.exclude_patterns = []
 
 
 @dataclass
@@ -237,13 +244,27 @@ def load_ignore(start_dir: str) -> IgnoreConfig:
                 cfg.packed_ok = True
             elif token == "MAGIC_OK":
                 cfg.magic_ok = True
+            elif token.startswith("EXCLUDE "):
+                pattern = token[8:].strip()
+                if pattern:
+                    cfg.exclude_patterns.append(pattern)
     return cfg
 
 
 def _ignore_has_any(ig: IgnoreConfig) -> bool:
     """ignoreフラグが1つでもTrueか"""
     return any([ig.global_ok, ig.macro_allow, ig.volatile_ok,
-                ig.packed_ok, ig.magic_ok])
+                ig.packed_ok, ig.magic_ok, len(ig.exclude_patterns) > 0])
+
+
+def is_excluded(filepath: str, ignore: IgnoreConfig) -> bool:
+    """ファイルがEXCLUDEパターンに一致するか"""
+    name = os.path.basename(filepath)
+    rel = filepath
+    for pat in ignore.exclude_patterns:
+        if fnmatch(name, pat) or fnmatch(rel, pat):
+            return True
+    return False
 
 
 def find_ignore(file_path: str) -> IgnoreConfig:
@@ -599,6 +620,189 @@ def check_volatile(fp, raw, cl, issues, ignore):
                     f"volatile変数{var}に複合代入使用。read-modify-writeは非アトミック、割り込み競合の危険"))
 
 
+def check_format_string(fp, raw, cl, issues):
+    """printf系関数のフォーマット文字列脆弱性検出"""
+    # printf系で第一引数(or第二引数)が変数のケース
+    # printf(var), fprintf(fp, var), sprintf(buf, var), snprintf(buf, n, var)
+    # 安全: printf("literal"), printf("%d", var)
+    fmt_funcs_1arg = re.compile(r'\b(printf|puts)\s*\(\s*(\w+)\s*[,)]')
+    fmt_funcs_2arg = re.compile(r'\b(fprintf|vfprintf)\s*\(\s*\w+\s*,\s*(\w+)\s*[,)]')
+    fmt_funcs_3arg = re.compile(r'\b(sprintf|snprintf)\s*\(\s*\w+\s*,\s*(?:\w+\s*,\s*)?(\w+)\s*[,)]')
+    for i, line in enumerate(cl):
+        for pat in [fmt_funcs_1arg, fmt_funcs_2arg, fmt_funcs_3arg]:
+            m = pat.search(line)
+            if m:
+                func, var = m.group(1), m.group(2)
+                # リテラル文字列は strip_comments_and_strings で消えているので
+                # 変数名が残っている = ユーザ入力の可能性
+                if var not in ("NULL", "stderr", "stdout", "stdin"):
+                    issues.append(Issue(Severity.CRITICAL, fp, i + 1,
+                        f"{func}の書式文字列に変数{var}を直接使用。"
+                        f"攻撃者制御で任意メモリ読み書き可能"))
+
+
+def check_use_after_free(fp, raw, cl, issues):
+    """free後のポインタ使用検出"""
+    free_re = re.compile(r'\bfree\s*\(\s*(\w+)\s*\)')
+    for i, line in enumerate(cl):
+        m = free_re.search(line)
+        if m:
+            var = m.group(1)
+            # free直後の行からスコープ末尾まで使用を追跡
+            for j in range(i + 1, min(i + 30, len(cl))):
+                # NULL代入 → 追跡終了
+                if re.search(rf'\b{re.escape(var)}\s*=\s*NULL\b', cl[j]):
+                    break
+                # 再代入 → 追跡終了
+                if re.search(rf'\b{re.escape(var)}\s*=\s*(?!NULL)', cl[j]):
+                    break
+                # スコープ終了
+                if cl[j].strip() == '}':
+                    break
+                # 再度free → double-free（別チェッカーで検出済み）
+                if re.search(rf'\bfree\s*\(\s*{re.escape(var)}\s*\)', cl[j]):
+                    break
+                # ポインタ参照（デリファレンス、メンバアクセス、配列添字、関数引数）
+                if re.search(rf'\b{re.escape(var)}\s*->', cl[j]) or \
+                   re.search(rf'\b{re.escape(var)}\s*\[', cl[j]) or \
+                   re.search(rf'\*\s*{re.escape(var)}\b', cl[j]):
+                    issues.append(Issue(Severity.CRITICAL, fp, j + 1,
+                        f"free済み{var}を参照(use-after-free)。{i+1}行目でfree済み"))
+                    break
+
+
+def check_uninitialized(fp, raw, cl, issues):
+    """未初期化ローカル変数の使用検出"""
+    # ポインタ・整数型のローカル変数宣言（初期化子なし）を検出
+    decl_re = re.compile(
+        r'^\s+(?:const\s+)?(?:unsigned\s+|signed\s+)?'
+        r'(?:int|char|short|long|float|double|size_t|uint\w+|int\w+|_Bool|bool)\s+'
+        r'(\w+)\s*;')
+    ptr_decl_re = re.compile(
+        r'^\s+(?:const\s+)?(?:unsigned\s+|signed\s+)?'
+        r'(?:int|char|short|long|float|double|size_t|uint\w+|int\w+|void|struct\s+\w+)\s*'
+        r'\*\s*(\w+)\s*;')
+    brace_depth = 0
+    for i, line in enumerate(cl):
+        brace_depth += line.count('{') - line.count('}')
+        if brace_depth < 1:
+            continue
+        m = decl_re.match(line) or ptr_decl_re.match(line)
+        if not m:
+            continue
+        var = m.group(1)
+        # 後続行で初期化前に使用されていないか確認
+        initialized = False
+        for j in range(i + 1, min(i + 15, len(cl))):
+            # 代入で初期化
+            if re.search(rf'\b{re.escape(var)}\s*=', cl[j]):
+                initialized = True
+                break
+            # 関数引数に&varで渡す（出力パラメータ）
+            if re.search(rf'&\s*{re.escape(var)}\b', cl[j]):
+                initialized = True
+                break
+            # スコープ終了
+            if cl[j].strip() == '}':
+                break
+            # 使用検出（右辺値、関数引数、配列添字、演算）
+            if re.search(rf'(?<!=)\b{re.escape(var)}\b(?!\s*=)', cl[j]) and \
+               not re.search(rf'&\s*{re.escape(var)}\b', cl[j]):
+                # 宣言行でないことを確認
+                if not decl_re.match(cl[j]) and not ptr_decl_re.match(cl[j]):
+                    issues.append(Issue(Severity.CRITICAL, fp, j + 1,
+                        f"未初期化変数{var}を使用({i+1}行目で宣言、初期化なし)。不定値"))
+                    break
+
+
+def check_sign_compare(fp, raw, cl, issues):
+    """signed/unsigned混合比較検出"""
+    # unsigned型変数の収集
+    unsigned_vars: Set[str] = set()
+    unsigned_re = re.compile(
+        r'\b(?:unsigned\s+(?:int|char|short|long)|uint\w+|size_t)\s+(\w+)')
+    signed_re = re.compile(
+        r'\b(?:(?:signed\s+)?(?:int|short|long))\s+(\w+)')
+    signed_vars: Set[str] = set()
+    for line in cl:
+        for m in unsigned_re.finditer(line):
+            unsigned_vars.add(m.group(1))
+        for m in signed_re.finditer(line):
+            signed_vars.add(m.group(1))
+    if not unsigned_vars or not signed_vars:
+        return
+    cmp_re = re.compile(r'(\w+)\s*([<>!=]=?)\s*(\w+)')
+    for i, line in enumerate(cl):
+        for m in cmp_re.finditer(line):
+            lhs, op, rhs = m.group(1), m.group(2), m.group(3)
+            if (lhs in unsigned_vars and rhs in signed_vars) or \
+               (lhs in signed_vars and rhs in unsigned_vars):
+                issues.append(Issue(Severity.DESIGN, fp, i + 1,
+                    f"signed({lhs if lhs in signed_vars else rhs})と"
+                    f"unsigned({lhs if lhs in unsigned_vars else rhs})の比較。"
+                    f"暗黙変換で負値が巨大正値に化ける"))
+
+
+def check_integer_overflow(fp, raw, cl, issues):
+    """整数オーバーフロー検出（malloc引数の乗算等）"""
+    # malloc(n * sizeof(...)) パターン
+    mul_alloc_re = re.compile(
+        r'\b(?:malloc|calloc|realloc)\s*\(\s*(\w+)\s*\*\s*(?:sizeof\b|(\w+))')
+    for i, line in enumerate(cl):
+        m = mul_alloc_re.search(line)
+        if m:
+            var = m.group(1)
+            # 直前にオーバーフローチェックがあるか
+            found = False
+            for j in range(max(0, i - 5), i):
+                if re.search(rf'\b{re.escape(var)}\b.*(?:MAX|LIMIT|SIZE_MAX|overflow)', cl[j], re.IGNORECASE) or \
+                   re.search(rf'if\s*\(.*{re.escape(var)}', cl[j]):
+                    found = True
+                    break
+            if not found:
+                issues.append(Issue(Severity.CRITICAL, fp, i + 1,
+                    f"malloc引数で{var}を乗算。オーバーフロー未検証でヒープ不足クラッシュ"))
+
+
+def check_resource_leak(fp, raw, cl, issues):
+    """socket/open/pipe等のリソースリーク検出"""
+    # open() のfd
+    open_re = re.compile(r'(\w+)\s*=\s*\bopen\s*\(')
+    socket_re = re.compile(r'(\w+)\s*=\s*\bsocket\s*\(')
+    pipe_re = re.compile(r'\bpipe\s*\(\s*(\w+)\s*\)')
+    full_text = "\n".join(cl)
+    for i, line in enumerate(cl):
+        m = open_re.search(line)
+        if m:
+            var = m.group(1)
+            if not re.search(rf'\bclose\s*\(\s*{re.escape(var)}\s*\)', full_text):
+                issues.append(Issue(Severity.CRITICAL, fp, i + 1,
+                    f"open結果{var}に対応するcloseなし。fdリーク"))
+        m = socket_re.search(line)
+        if m:
+            var = m.group(1)
+            if not re.search(rf'\bclose\s*\(\s*{re.escape(var)}\s*\)', full_text) and \
+               not re.search(rf'\bclosesocket\s*\(\s*{re.escape(var)}\s*\)', full_text):
+                issues.append(Issue(Severity.CRITICAL, fp, i + 1,
+                    f"socket結果{var}に対応するcloseなし。ソケットリーク"))
+        m = pipe_re.search(line)
+        if m:
+            arr = m.group(1)
+            if not re.search(rf'\bclose\s*\(\s*{re.escape(arr)}\s*\[', full_text):
+                issues.append(Issue(Severity.CRITICAL, fp, i + 1,
+                    f"pipe({arr})に対応するcloseなし。fdリーク"))
+
+
+def check_snprintf_retval(fp, raw, cl, issues):
+    """snprintf戻り値無視検出"""
+    # snprintf単独呼び出し（戻り値を変数に代入していない）
+    snprintf_re = re.compile(r'^\s*snprintf\s*\(')
+    for i, line in enumerate(cl):
+        if snprintf_re.match(line):
+            issues.append(Issue(Severity.MAINT, fp, i + 1,
+                "snprintf戻り値を未確認。切り詰め発生を検出できない"))
+
+
 def check_packed(fp, raw, cl, issues, ignore):
     """packed構造体の危険パターン検出"""
     if ignore.packed_ok:
@@ -678,6 +882,21 @@ def run_local_analysis(filepath: str, ignore: IgnoreConfig) -> List[Issue]:
     check_magic_numbers(filepath, raw, cl, issues, ignore)
     check_volatile(filepath, raw, cl, issues, ignore)
     check_packed(filepath, raw, cl, issues, ignore)
+    check_format_string(filepath, raw, cl, issues)
+    check_use_after_free(filepath, raw, cl, issues)
+    check_uninitialized(filepath, raw, cl, issues)
+    check_sign_compare(filepath, raw, cl, issues)
+    check_integer_overflow(filepath, raw, cl, issues)
+    check_resource_leak(filepath, raw, cl, issues)
+    check_snprintf_retval(filepath, raw, cl, issues)
+
+    # NOCHECK行単位抑制: 元ソースのコメントに "NOCHECK" があれば除外
+    nocheck_lines: Set[int] = set()
+    for i, rl in enumerate(raw):
+        if "NOCHECK" in rl:
+            nocheck_lines.add(i + 1)
+    if nocheck_lines:
+        issues = [iss for iss in issues if iss.line not in nocheck_lines]
 
     issues.sort(key=lambda x: x.line)
     return issues
@@ -891,6 +1110,38 @@ def run_api_review_spec(spec_path: str, config: AppConfig) -> str:
 # 出力フォーマッタ
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+def get_diff_lines(filepath: str) -> Optional[Set[int]]:
+    """git diffから変更行番号を取得。git外ならNone"""
+    try:
+        result = subprocess.run(
+            ["git", "diff", "--unified=0", "HEAD", "--", filepath],
+            capture_output=True, text=True, timeout=10)
+        if result.returncode != 0:
+            # ステージング済みも試行
+            result = subprocess.run(
+                ["git", "diff", "--unified=0", "--cached", "--", filepath],
+                capture_output=True, text=True, timeout=10)
+            if result.returncode != 0:
+                return None
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    changed: Set[int] = set()
+    for line in result.stdout.split("\n"):
+        # @@ -a,b +c,d @@ 形式をパース
+        m = re.match(r'^@@ .* \+(\d+)(?:,(\d+))? @@', line)
+        if m:
+            start = int(m.group(1))
+            count = int(m.group(2)) if m.group(2) else 1
+            for ln in range(start, start + count):
+                changed.add(ln)
+    return changed
+
+
+def filter_by_diff(issues: List[Issue], diff_lines: Set[int]) -> List[Issue]:
+    """差分行に該当する指摘のみ残す"""
+    return [iss for iss in issues if iss.line in diff_lines]
+
+
 def format_text(issues: List[Issue]) -> str:
     if not issues:
         return "重大なし\n設計不明なし\n保守危険なし"
@@ -899,6 +1150,25 @@ def format_text(issues: List[Issue]) -> str:
         lines.append(f"[{iss.severity.value}]")
         lines.append(f"{iss.filepath}:{iss.line}")
         lines.append(iss.message)
+        lines.append("")
+    return "\n".join(lines)
+
+
+def format_markdown(issues: List[Issue], filepath: str) -> str:
+    """Markdown形式で指摘を出力"""
+    lines = [f"## {filepath}\n"]
+    if not issues:
+        lines.append("問題なし\n")
+        return "\n".join(lines)
+    severity_map = {Severity.CRITICAL: "🔴", Severity.DESIGN: "🟡", Severity.MAINT: "🔵"}
+    for sev in [Severity.CRITICAL, Severity.DESIGN, Severity.MAINT]:
+        sev_issues = [i for i in issues if i.severity == sev]
+        if not sev_issues:
+            continue
+        icon = severity_map[sev]
+        lines.append(f"### {icon} {sev.value} ({len(sev_issues)}件)\n")
+        for iss in sev_issues:
+            lines.append(f"- **L{iss.line}**: {iss.message}")
         lines.append("")
     return "\n".join(lines)
 
@@ -953,10 +1223,12 @@ def main():
                         help="対象 .c/.h ファイルまたはディレクトリ")
     parser.add_argument("--spec", action="store_true",
                         help="仕様レビューモード (対象は仕様テキストファイル)")
-    parser.add_argument("--format", choices=["text", "json"], default="text",
+    parser.add_argument("--format", choices=["text", "json", "markdown"], default="text",
                         help="出力形式 (default: text)")
     parser.add_argument("--local-only", action="store_true",
                         help="ローカル静的解析のみ (API呼び出しなし)")
+    parser.add_argument("--diff", action="store_true",
+                        help="git diffの変更行のみレビュー")
     parser.add_argument("--version", action="version",
                         version=f"creview {VERSION}")
     args = parser.parse_args()
@@ -992,11 +1264,24 @@ def main():
     for fpath in files:
         ignore = find_ignore(fpath)
 
+        # EXCLUDE判定
+        if is_excluded(fpath, ignore):
+            continue
+
         # Phase 1: ローカル静的解析
         local_issues = run_local_analysis(fpath, ignore)
 
+        # --diff: 変更行のみにフィルタ
+        if args.diff:
+            diff_lines = get_diff_lines(fpath)
+            if diff_lines is not None:
+                local_issues = filter_by_diff(local_issues, diff_lines)
+            # diff_lines=None（git外）の場合はフィルタなしで全件出力
+
         if args.format == "json":
             print(format_json_v2(local_issues, fpath))
+        elif args.format == "markdown":
+            print(format_markdown(local_issues, fpath))
         else:
             if local_issues:
                 print(f"── ローカル解析: {fpath} ──")
