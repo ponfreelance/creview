@@ -1276,22 +1276,8 @@ def _get_obj_func_sizes(filepath: str) -> Optional[Dict[str, int]]:
                     sizes[fname] = size
             return sizes if sizes else None
         # サイズ列がない場合: 全シンボルをアドレス順ソートし隣接差から推定
-        # sizeコマンドでテキストセクション総サイズを取得(最後のシンボル用)
-        text_total = None
-        try:
-            size_result = subprocess.run(
-                ["size", obj_path],
-                capture_output=True, text=True, timeout=10)
-            if size_result.returncode == 0:
-                slines = size_result.stdout.strip().splitlines()
-                if len(slines) >= 2:
-                    sparts = slines[1].split()
-                    if sparts:
-                        text_total = int(sparts[0])
-        except (OSError, subprocess.TimeoutExpired, ValueError):
-            pass
         all_symbols.sort(key=lambda s: s[0])
-        sizes = {}
+        reliable: Dict[str, int] = {}
         for idx, (addr, fname, _, is_user) in enumerate(all_symbols):
             if not is_user:
                 continue
@@ -1302,14 +1288,12 @@ def _get_obj_func_sizes(filepath: str) -> Optional[Dict[str, int]]:
                     next_addr = all_symbols[j][0]
                     break
             if next_addr is not None:
-                sizes[fname] = next_addr - addr
-            elif text_total is not None:
-                # 最後のシンボル: テキストセクション総サイズから算出
-                sizes[fname] = text_total - addr
-            else:
-                # フォールバック: サイズ不明
-                sizes[fname] = 0
-        return sizes if sizes else None
+                reliable[fname] = next_addr - addr
+            # 最後のシンボル: 隣接シンボルがないためサイズ推定不能
+            # (セクションパディングで膨らむので信頼できない)
+            # → reliable に含めず、他に信頼できるサイズがなければNone返却
+        # 信頼できるサイズが1つもなければソース解析にフォールバック
+        return reliable if reliable else None
     except (OSError, subprocess.TimeoutExpired):
         return None
     finally:
