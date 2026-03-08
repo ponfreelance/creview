@@ -1,5 +1,5 @@
 ============================================
-C設計レビューAI  CReview v0.9.0
+C設計レビューAI  CReview v0.10.0
 ============================================
 
 
@@ -209,7 +209,35 @@ critical / design / maint から選択。
 
   creview --fix-hint --local-only main.c
 
-各指摘に修正方法のヒントを付与して表示。
+各指摘に修正方法のヒントを1行で付与して表示。
+
+
+■ 修正案表示 (--fix)
+--------------------------------------------
+
+  creview --fix --local-only main.c
+  creview --fix --format markdown --local-only src/
+
+各指摘に2パターンの修正コードを表示：
+
+  [最小修正] そのまま動かすための最低限の修正
+  [推奨修正] 本来こうすべきという修正
+
+出力例:
+  [重大]
+  main.c:15
+  pにNULLチェックなし。malloc失敗時クラッシュ
+    [最小修正]
+      char *p = malloc(100);
+      if (p == NULL) return;
+    [推奨修正]
+      char *p = malloc(100);
+      if (p == NULL) {
+          fprintf(stderr, "メモリ確保失敗: p\n");
+          return -1;
+      }
+
+--fix-hint (1行ヒント) と --fix (コード例) は併用可能。
 
 
 ■ ベースライン差分

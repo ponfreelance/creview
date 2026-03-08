@@ -20,7 +20,7 @@ from fnmatch import fnmatch
 import subprocess
 
 # ─── バージョン / 定数 ────────────────────────────────
-VERSION = "0.9.0"
+VERSION = "0.10.0"
 IGNOREFILE = ".creviewignore"
 CONFIGFILE = "config.txt"
 MAX_CHUNK_BYTES = 80_000
@@ -1557,6 +1557,464 @@ def get_fix_hint(message: str) -> str:
     return ""
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# --fix 修正案生成 (最小修正 + 推奨修正)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@dataclass
+class FixSuggestion:
+    minimal: str       # 最小修正コード
+    recommended: str   # 推奨修正コード
+
+
+def _extract_var_from_msg(message: str, pattern: str) -> str:
+    """メッセージから変数名を抽出"""
+    m = re.match(pattern, message)
+    return m.group(1) if m else "ptr"
+
+
+def generate_fix(message: str, source_line: str) -> Optional[FixSuggestion]:
+    """指摘メッセージとソース行から修正案を生成"""
+    line = source_line.strip()
+    indent = source_line[:len(source_line) - len(source_line.lstrip())]
+
+    # --- malloc/calloc/realloc NULLチェック漏れ ---
+    if "NULLチェックなし" in message and ("malloc" in message or "calloc" in message or "realloc" in message):
+        var = _extract_var_from_msg(message, r'^(\w+)に')
+        return FixSuggestion(
+            minimal=(
+                f"{indent}{line}\n"
+                f"{indent}if ({var} == NULL) return;"
+            ),
+            recommended=(
+                f"{indent}{line}\n"
+                f"{indent}if ({var} == NULL) {{\n"
+                f"{indent}    fprintf(stderr, \"メモリ確保失敗: {var}\\n\");\n"
+                f"{indent}    return -1;\n"
+                f"{indent}}}"
+            ),
+        )
+
+    # --- gets使用 ---
+    if "gets使用" in message:
+        m = re.search(r'gets\s*\(\s*(\w+)\s*\)', line)
+        buf = m.group(1) if m else "buf"
+        return FixSuggestion(
+            minimal=f"{indent}fgets({buf}, sizeof({buf}), stdin);",
+            recommended=(
+                f"{indent}if (fgets({buf}, sizeof({buf}), stdin) != NULL) {{\n"
+                f"{indent}    {buf}[strcspn({buf}, \"\\n\")] = '\\0';\n"
+                f"{indent}}}"
+            ),
+        )
+
+    # --- sprintf使用 ---
+    if "sprintf使用" in message:
+        m = re.search(r'sprintf\s*\(\s*(\w+)\s*,\s*(.+)\)', line)
+        if m:
+            buf, args = m.group(1), m.group(2)
+            return FixSuggestion(
+                minimal=f"{indent}snprintf({buf}, sizeof({buf}), {args});",
+                recommended=(
+                    f"{indent}int ret = snprintf({buf}, sizeof({buf}), {args});\n"
+                    f"{indent}if (ret >= (int)sizeof({buf})) {{\n"
+                    f"{indent}    /* 切り詰め発生 */\n"
+                    f"{indent}}}"
+                ),
+            )
+
+    # --- strcpy使用 ---
+    if "strcpy使用" in message:
+        m = re.search(r'strcpy\s*\(\s*(\w+)\s*,\s*(.+?)\s*\)', line)
+        if m:
+            dst, src = m.group(1), m.group(2)
+            return FixSuggestion(
+                minimal=(
+                    f"{indent}strncpy({dst}, {src}, sizeof({dst}) - 1);\n"
+                    f"{indent}{dst}[sizeof({dst}) - 1] = '\\0';"
+                ),
+                recommended=(
+                    f"{indent}size_t len = strlen({src});\n"
+                    f"{indent}if (len >= sizeof({dst})) {{\n"
+                    f"{indent}    /* エラー処理: 入力が長すぎる */\n"
+                    f"{indent}    return -1;\n"
+                    f"{indent}}}\n"
+                    f"{indent}memcpy({dst}, {src}, len + 1);"
+                ),
+            )
+
+    # --- strcat使用 ---
+    if "strcat使用" in message:
+        m = re.search(r'strcat\s*\(\s*(\w+)\s*,\s*(.+?)\s*\)', line)
+        if m:
+            dst, src = m.group(1), m.group(2)
+            return FixSuggestion(
+                minimal=(
+                    f"{indent}strncat({dst}, {src}, sizeof({dst}) - strlen({dst}) - 1);"
+                ),
+                recommended=(
+                    f"{indent}size_t remain = sizeof({dst}) - strlen({dst}) - 1;\n"
+                    f"{indent}if (strlen({src}) > remain) {{\n"
+                    f"{indent}    /* エラー処理: バッファ不足 */\n"
+                    f"{indent}    return -1;\n"
+                    f"{indent}}}\n"
+                    f"{indent}strncat({dst}, {src}, remain);"
+                ),
+            )
+
+    # --- NULL未検証 (memcpy等) ---
+    if "NULL未検証" in message:
+        m = re.search(r'(memcpy|memmove|memset)\s*\(\s*(\w+)', line)
+        if m:
+            func, var = m.group(1), m.group(2)
+            return FixSuggestion(
+                minimal=(
+                    f"{indent}if ({var} != NULL) {{\n"
+                    f"{indent}    {line}\n"
+                    f"{indent}}}"
+                ),
+                recommended=(
+                    f"{indent}if ({var} == NULL) {{\n"
+                    f"{indent}    /* エラー処理 */\n"
+                    f"{indent}    return;\n"
+                    f"{indent}}}\n"
+                    f"{indent}{line}"
+                ),
+            )
+
+    # --- 二重free ---
+    if "二重free" in message:
+        m = re.search(r'free\s*\(\s*(\w+)\s*\)', line)
+        var = m.group(1) if m else "ptr"
+        return FixSuggestion(
+            minimal=f"{indent}if ({var} != NULL) {{ free({var}); {var} = NULL; }}",
+            recommended=(
+                f"{indent}/* 初回free時にNULL代入済みのため、この行を削除 */\n"
+                f"{indent}/* free({var}); */"
+            ),
+        )
+
+    # --- use-after-free ---
+    if "use-after-free" in message:
+        m = re.search(r'free済み(\w+)を参照', message)
+        var = m.group(1) if m else "ptr"
+        return FixSuggestion(
+            minimal=(
+                f"{indent}/* {var}はfree済み。この行の前でfree後に{var} = NULLを追加 */\n"
+                f"{indent}/* {line}  ← 削除またはfreeの前に移動 */"
+            ),
+            recommended=(
+                f"{indent}/* free直後に{var} = NULL; を追加し、使用前にNULLチェック */\n"
+                f"{indent}if ({var} != NULL) {{\n"
+                f"{indent}    {line}\n"
+                f"{indent}}}"
+            ),
+        )
+
+    # --- 未初期化変数 ---
+    if "未初期化変数" in message:
+        m = re.search(r'未初期化変数(\w+)を', message)
+        var = m.group(1) if m else "x"
+        m2 = re.search(r'(int|char|short|long|float|double|size_t|unsigned)\s+' + re.escape(var), line)
+        if m2:
+            typ = m2.group(1)
+            init_val = "0" if typ in ("int", "short", "long", "size_t", "unsigned") else \
+                       "'\\0'" if typ == "char" else "0.0"
+            return FixSuggestion(
+                minimal=f"{indent}{typ} {var} = {init_val};",
+                recommended=(
+                    f"{indent}{typ} {var} = {init_val};  /* 明示的初期化 */\n"
+                    f"{indent}/* 可能なら宣言を初回代入箇所に移動 */"
+                ),
+            )
+
+    # --- 書式文字列脆弱性 ---
+    if "書式文字列" in message:
+        m = re.search(r'(printf|fprintf|syslog)\s*\(\s*(\w+)\s*\)', line)
+        if m:
+            func, var = m.group(1), m.group(2)
+            return FixSuggestion(
+                minimal=f"{indent}{func}(\"%s\", {var});",
+                recommended=f"{indent}fputs({var}, stdout);  /* 書式不要なら出力関数変更 */",
+            )
+        # fprintf(fp, var) パターン
+        m = re.search(r'fprintf\s*\(\s*(\w+)\s*,\s*(\w+)\s*\)', line)
+        if m:
+            fp, var = m.group(1), m.group(2)
+            return FixSuggestion(
+                minimal=f"{indent}fprintf({fp}, \"%s\", {var});",
+                recommended=f"{indent}fputs({var}, {fp});",
+            )
+
+    # --- 整数オーバーフロー ---
+    if "オーバーフロー未検証" in message:
+        m = re.search(r'malloc\s*\(\s*(\w+)\s*\*\s*(\w+)', line)
+        if m:
+            a, b = m.group(1), m.group(2)
+            return FixSuggestion(
+                minimal=f"{indent}/* {a} * {b} のオーバーフローチェックを追加 */\n{indent}{line}",
+                recommended=(
+                    f"{indent}if ({a} > 0 && {b} > SIZE_MAX / {a}) {{\n"
+                    f"{indent}    /* オーバーフロー検出 */\n"
+                    f"{indent}    return NULL;\n"
+                    f"{indent}}}\n"
+                    f"{indent}{line}"
+                ),
+            )
+
+    # --- sizeof(ポインタ) ---
+    if "sizeof" in message and "ポインタ" in message:
+        m = re.search(r'sizeof\s*\(\s*(\w+)\s*\)', line)
+        if m:
+            var = m.group(1)
+            return FixSuggestion(
+                minimal=f"{indent}/* sizeof({var}) → sizeof(*{var}) に変更 */",
+                recommended=f"{indent}/* sizeof({var}) は配列なら sizeof(配列)/sizeof(配列[0])、ポインタなら sizeof(*{var}) */",
+            )
+
+    # --- fdリーク / fclose ---
+    if "fclose" in message and "リーク" in message:
+        m = re.search(r'(\w+)\s*=\s*fopen', line)
+        var = m.group(1) if m else "fp"
+        return FixSuggestion(
+            minimal=f"{indent}{line}\n{indent}/* ... */\n{indent}fclose({var});",
+            recommended=(
+                f"{indent}{line}\n"
+                f"{indent}if ({var} == NULL) {{\n"
+                f"{indent}    perror(\"fopen\");\n"
+                f"{indent}    return -1;\n"
+                f"{indent}}}\n"
+                f"{indent}/* ... 処理 ... */\n"
+                f"{indent}fclose({var});"
+            ),
+        )
+
+    # --- リソースリーク (open/socket) ---
+    if "リソースリーク" in message or "close()なし" in message:
+        m = re.search(r'(\w+)\s*=\s*(open|socket|pipe)', line)
+        if m:
+            var = m.group(1)
+            return FixSuggestion(
+                minimal=f"{indent}{line}\n{indent}/* ... */\n{indent}close({var});",
+                recommended=(
+                    f"{indent}{line}\n"
+                    f"{indent}if ({var} < 0) {{\n"
+                    f"{indent}    perror(\"{m.group(2)}\");\n"
+                    f"{indent}    return -1;\n"
+                    f"{indent}}}\n"
+                    f"{indent}/* ... 処理 ... */\n"
+                    f"{indent}close({var});"
+                ),
+            )
+
+    # --- fall-through ---
+    if "fall-through" in message:
+        return FixSuggestion(
+            minimal=f"{indent}break;  /* case末尾に追加 */",
+            recommended=f"{indent}break;\n{indent}/* 意図的なfall-throughなら: */\n{indent}/* FALLTHROUGH */",
+        )
+
+    # --- バッファオーバーラン ---
+    if "バッファオーバーラン" in message:
+        m = re.search(r'(strncpy|memcpy)\s*\(\s*(\w+)\s*,\s*(.+?)\s*,\s*(.+?)\s*\)', line)
+        if m:
+            func, dst = m.group(1), m.group(2)
+            return FixSuggestion(
+                minimal=f"{indent}{func}({dst}, ..., sizeof({dst}));",
+                recommended=(
+                    f"{indent}{func}({dst}, ..., sizeof({dst}) - 1);\n"
+                    f"{indent}{dst}[sizeof({dst}) - 1] = '\\0';"
+                    if func == "strncpy" else
+                    f"{indent}{func}({dst}, ..., sizeof({dst}));"
+                ),
+            )
+
+    # --- デッドロック (mutex) ---
+    if "デッドロック" in message or "unlock" in message.lower():
+        return FixSuggestion(
+            minimal=f"{indent}pthread_mutex_unlock(&mutex);  /* 全パスに追加 */",
+            recommended=(
+                f"{indent}pthread_mutex_lock(&mutex);\n"
+                f"{indent}/* ... 排他処理 ... */\n"
+                f"{indent}pthread_mutex_unlock(&mutex);\n"
+                f"{indent}/* エラーパスにもunlockを忘れずに */"
+            ),
+        )
+
+    # --- TOCTOU ---
+    if "TOCTOU" in message:
+        return FixSuggestion(
+            minimal=f"{indent}/* access()を削除し、open()の戻り値で直接判定 */",
+            recommended=(
+                f"{indent}int fd = open(path, O_RDONLY);\n"
+                f"{indent}if (fd < 0) {{\n"
+                f"{indent}    /* ファイルなし or 権限なし */\n"
+                f"{indent}    return -1;\n"
+                f"{indent}}}\n"
+                f"{indent}/* fdを使って操作 */"
+            ),
+        )
+
+    # --- async-signal-unsafe ---
+    if "async-signal-unsafe" in message:
+        return FixSuggestion(
+            minimal=f"{indent}/* シグナルハンドラ内ではwrite()を使用 */",
+            recommended=(
+                f"{indent}static volatile sig_atomic_t flag = 0;\n"
+                f"{indent}/* ハンドラ内: */\n"
+                f"{indent}void handler(int sig) {{ flag = 1; }}\n"
+                f"{indent}/* メインループで: */\n"
+                f"{indent}if (flag) {{ /* 安全に処理 */ }}"
+            ),
+        )
+
+    # --- snprintf戻り値 (切り詰めより先に判定) ---
+    if "snprintf" in message and "戻り値" in message:
+        m = re.search(r'snprintf\s*\(\s*(\w+)\s*,\s*([^,]+)\s*,', line)
+        if m:
+            buf, size = m.group(1), m.group(2)
+            return FixSuggestion(
+                minimal=f"{indent}(void)snprintf({buf}, {size}, ...);  /* 明示的に無視 */",
+                recommended=(
+                    f"{indent}int ret = snprintf({buf}, {size}, ...);\n"
+                    f"{indent}if (ret < 0 || ret >= (int){size}) {{\n"
+                    f"{indent}    /* 出力エラーまたは切り詰め発生 */\n"
+                    f"{indent}}}"
+                ),
+            )
+
+    # --- 切り詰めキャスト ---
+    if "切り詰め" in message:
+        return FixSuggestion(
+            minimal=f"{indent}/* キャスト前に値域チェックを追加 */",
+            recommended=(
+                f"{indent}if (value > TARGET_MAX || value < TARGET_MIN) {{\n"
+                f"{indent}    /* 範囲外エラー */\n"
+                f"{indent}    return -1;\n"
+                f"{indent}}}\n"
+                f"{indent}target = (target_type)value;"
+            ),
+        )
+
+    # --- ビットフィールド符号 ---
+    if "符号未指定" in message:
+        m = re.search(r'\bint\s+(\w+)\s*:\s*(\d+)', line)
+        if m:
+            field, bits = m.group(1), m.group(2)
+            return FixSuggestion(
+                minimal=f"{indent}unsigned int {field} : {bits};",
+                recommended=f"{indent}unsigned int {field} : {bits};  /* または signed int {field} : {bits}; 意図を明示 */",
+            )
+
+    # --- VLA ---
+    if "可変長配列" in message:
+        m = re.search(r'(\w+)\s+(\w+)\s*\[\s*(\w+)\s*\]', line)
+        if m:
+            typ, arr, size = m.group(1), m.group(2), m.group(3)
+            return FixSuggestion(
+                minimal=f"{indent}{typ} *{arr} = malloc({size} * sizeof({typ}));",
+                recommended=(
+                    f"{indent}{typ} *{arr} = malloc({size} * sizeof({typ}));\n"
+                    f"{indent}if ({arr} == NULL) {{\n"
+                    f"{indent}    return -1;\n"
+                    f"{indent}}}\n"
+                    f"{indent}/* ... 処理 ... */\n"
+                    f"{indent}free({arr});"
+                ),
+            )
+
+    # --- goto ---
+    if "前方" in message and "goto" in message.lower():
+        return FixSuggestion(
+            minimal=f"{indent}/* gotoをwhile/forループに構造化 */",
+            recommended=(
+                f"{indent}/* エラー処理パターン (唯一許容されるgoto): */\n"
+                f"{indent}if (error) goto cleanup;\n"
+                f"{indent}/* ... */\n"
+                f"{indent}cleanup:\n"
+                f"{indent}    free(resource);\n"
+                f"{indent}    return -1;"
+            ),
+        )
+
+    # --- マジックナンバー ---
+    if "マジックナンバー" in message:
+        m = re.search(r'(\d+)', line)
+        num = m.group(1) if m else "VALUE"
+        return FixSuggestion(
+            minimal=f"{indent}#define MAGIC_{num} {num}  /* 定数定義を追加 */",
+            recommended=(
+                f"{indent}enum {{ BUFFER_SIZE = {num} }};  /* または */\n"
+                f"{indent}static const int PARAM = {num};"
+            ),
+        )
+
+    # --- defaultなし ---
+    if "defaultなし" in message:
+        return FixSuggestion(
+            minimal=f"{indent}default: break;",
+            recommended=(
+                f"{indent}default:\n"
+                f"{indent}    assert(0 && \"未定義のenum値\");\n"
+                f"{indent}    break;"
+            ),
+        )
+
+    # --- グローバル変数 ---
+    if "グローバル変数" in message:
+        m = re.search(r'(\w+)を直接更新', message)
+        var = m.group(1) if m else "g_var"
+        return FixSuggestion(
+            minimal=f"{indent}/* {var} を引数経由で渡す */",
+            recommended=(
+                f"{indent}/* 関数の引数にポインタで渡す: */\n"
+                f"{indent}void func({type(var).__name__} *{var}_ptr) {{\n"
+                f"{indent}    *{var}_ptr = new_value;\n"
+                f"{indent}}}"
+            ),
+        )
+
+    # --- 自己再帰 ---
+    if "自己再帰" in message:
+        return FixSuggestion(
+            minimal=f"{indent}/* depth引数を追加し上限チェック */",
+            recommended=(
+                f"{indent}void func(int depth) {{\n"
+                f"{indent}    if (depth > MAX_DEPTH) return;\n"
+                f"{indent}    /* ... */\n"
+                f"{indent}    func(depth + 1);\n"
+                f"{indent}}}"
+            ),
+        )
+
+    # --- 無限ループ ---
+    if "無限ループ" in message:
+        return FixSuggestion(
+            minimal=f"{indent}/* break/return条件を追加 */",
+            recommended=(
+                f"{indent}int count = 0;\n"
+                f"{indent}while (1) {{\n"
+                f"{indent}    if (++count > MAX_ITER || done) break;\n"
+                f"{indent}    /* ... */\n"
+                f"{indent}}}"
+            ),
+        )
+
+    # --- signed/unsigned比較 ---
+    if "signed" in message and "unsigned" in message and "比較" in message:
+        return FixSuggestion(
+            minimal=f"{indent}/* 比較前にキャストで型を揃える */",
+            recommended=(
+                f"{indent}/* signed値が負でないことを確認してからキャスト: */\n"
+                f"{indent}if (signed_val >= 0 && (unsigned)signed_val < unsigned_val) {{\n"
+                f"{indent}    /* ... */\n"
+                f"{indent}}}"
+            ),
+        )
+
+    return None
+
+
 # --preset用: プリセットグループ定義
 PRESETS = {
     "memory": {
@@ -1713,7 +2171,20 @@ def filter_by_diff(issues: List[Issue], diff_lines: Set[int]) -> List[Issue]:
     return [iss for iss in issues if iss.line in diff_lines]
 
 
-def format_text(issues: List[Issue], fix_hint: bool = False) -> str:
+def _read_source_line(filepath: str, line_num: int) -> str:
+    """ファイルの指定行を読み取る"""
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+            for i, line in enumerate(f, 1):
+                if i == line_num:
+                    return line.rstrip("\n")
+    except OSError:
+        pass
+    return ""
+
+
+def format_text(issues: List[Issue], fix_hint: bool = False,
+                fix: bool = False) -> str:
     if not issues:
         return "重大なし\n設計不明なし\n保守危険なし"
     lines = []
@@ -1725,11 +2196,22 @@ def format_text(issues: List[Issue], fix_hint: bool = False) -> str:
             hint = get_fix_hint(iss.message)
             if hint:
                 lines.append(hint)
+        if fix and iss.line > 0:
+            src_line = _read_source_line(iss.filepath, iss.line)
+            suggestion = generate_fix(iss.message, src_line)
+            if suggestion:
+                lines.append("  [最小修正]")
+                for sl in suggestion.minimal.split("\n"):
+                    lines.append(f"    {sl}")
+                lines.append("  [推奨修正]")
+                for sl in suggestion.recommended.split("\n"):
+                    lines.append(f"    {sl}")
         lines.append("")
     return "\n".join(lines)
 
 
-def format_markdown(issues: List[Issue], filepath: str, fix_hint: bool = False) -> str:
+def format_markdown(issues: List[Issue], filepath: str,
+                     fix_hint: bool = False, fix: bool = False) -> str:
     """Markdown形式で指摘を出力"""
     lines = [f"## {filepath}\n"]
     if not issues:
@@ -1749,6 +2231,18 @@ def format_markdown(issues: List[Issue], filepath: str, fix_hint: bool = False) 
                 if hint:
                     hint_str = f" `{hint}`"
             lines.append(f"- **L{iss.line}**: {iss.message}{hint_str}")
+            if fix and iss.line > 0:
+                src_line = _read_source_line(iss.filepath, iss.line)
+                suggestion = generate_fix(iss.message, src_line)
+                if suggestion:
+                    lines.append(f"  - **最小修正:**")
+                    lines.append(f"    ```c")
+                    lines.append(f"    {suggestion.minimal}")
+                    lines.append(f"    ```")
+                    lines.append(f"  - **推奨修正:**")
+                    lines.append(f"    ```c")
+                    lines.append(f"    {suggestion.recommended}")
+                    lines.append(f"    ```")
         lines.append("")
     return "\n".join(lines)
 
@@ -1864,6 +2358,8 @@ def main():
                         help="重大度別集計のみ出力")
     parser.add_argument("--fix-hint", action="store_true",
                         help="各指摘に修正ヒントを付与")
+    parser.add_argument("--fix", action="store_true",
+                        help="各指摘に最小修正・推奨修正のコード例を表示")
     parser.add_argument("--baseline",
                         help="ベースラインJSONファイル。新規指摘のみ表示")
     parser.add_argument("--exit-code",
@@ -2006,14 +2502,15 @@ def main():
             pass  # 全ファイル処理後にまとめて出力
         else:
             use_hint = args.fix_hint
+            use_fix = args.fix
             if args.format == "json":
                 print(format_json_v2(local_issues, fpath))
             elif args.format == "markdown":
-                print(format_markdown(local_issues, fpath, fix_hint=use_hint))
+                print(format_markdown(local_issues, fpath, fix_hint=use_hint, fix=use_fix))
             else:
                 if local_issues:
                     print(f"── ローカル解析: {fpath} ──")
-                    print(format_text(local_issues, fix_hint=use_hint))
+                    print(format_text(local_issues, fix_hint=use_hint, fix=use_fix))
 
         if any(i.severity == Severity.CRITICAL for i in local_issues):
             has_critical = True

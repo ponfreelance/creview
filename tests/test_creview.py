@@ -651,5 +651,147 @@ class TestAskResult(unittest.TestCase):
         self.assertNotIn("invalid_rule_xyz", only_rules)
 
 
+class TestGenerateFix(unittest.TestCase):
+    def test_malloc_null_fix(self):
+        """malloc NULLチェック漏れの修正案が生成される"""
+        msg = "pにNULLチェックなし。malloc/calloc/realloc失敗時クラッシュ"
+        src = "    char *p = malloc(100);"
+        fix = creview.generate_fix(msg, src)
+        self.assertIsNotNone(fix)
+        self.assertIn("if (p == NULL)", fix.minimal)
+        self.assertIn("if (p == NULL)", fix.recommended)
+        self.assertIn("fprintf", fix.recommended)
+
+    def test_gets_fix(self):
+        """gets使用の修正案"""
+        msg = "gets使用。バッファ長制限なし、確実にオーバーフロー可能"
+        src = "    gets(buf);"
+        fix = creview.generate_fix(msg, src)
+        self.assertIsNotNone(fix)
+        self.assertIn("fgets(buf", fix.minimal)
+        self.assertIn("strcspn", fix.recommended)
+
+    def test_sprintf_fix(self):
+        """sprintf使用の修正案"""
+        msg = "sprintf使用。出力バッファ長未検証でオーバーフロー可能"
+        src = '    sprintf(buf, "%s", name);'
+        fix = creview.generate_fix(msg, src)
+        self.assertIsNotNone(fix)
+        self.assertIn("snprintf(buf, sizeof(buf)", fix.minimal)
+        self.assertIn("int ret =", fix.recommended)
+
+    def test_format_string_fix(self):
+        """フォーマット文字列脆弱性の修正案"""
+        msg = "書式文字列脆弱性: printf()に変数直接渡し"
+        src = "    printf(user_input);"
+        fix = creview.generate_fix(msg, src)
+        self.assertIsNotNone(fix)
+        self.assertIn('printf("%s"', fix.minimal)
+
+    def test_double_free_fix(self):
+        """二重freeの修正案"""
+        msg = "二重free: pは既にfree済み"
+        src = "    free(p);"
+        fix = creview.generate_fix(msg, src)
+        self.assertIsNotNone(fix)
+        self.assertIn("NULL", fix.minimal)
+
+    def test_use_after_free_fix(self):
+        """use-after-freeの修正案"""
+        msg = "free済みpを参照(use-after-free)。5行目でfree済み"
+        src = "    p->next = 0;"
+        fix = creview.generate_fix(msg, src)
+        self.assertIsNotNone(fix)
+        self.assertIn("free済み", fix.minimal)
+
+    def test_uninit_fix(self):
+        """未初期化変数の修正案"""
+        msg = "未初期化変数xを使用(3行目で宣言、初期化なし)。不定値"
+        src = "    int x;"
+        fix = creview.generate_fix(msg, src)
+        self.assertIsNotNone(fix)
+        self.assertIn("int x = 0", fix.minimal)
+
+    def test_toctou_fix(self):
+        """TOCTOU修正案"""
+        msg = "TOCTOU競合: access()とopen()間にレース条件"
+        src = "    if (access(path, R_OK) == 0) {"
+        fix = creview.generate_fix(msg, src)
+        self.assertIsNotNone(fix)
+        self.assertIn("open()", fix.minimal)
+
+    def test_vla_fix(self):
+        """VLA修正案"""
+        msg = "可変長配列(VLA)使用。スタックオーバーフローの危険"
+        src = "    char buf[n];"
+        fix = creview.generate_fix(msg, src)
+        self.assertIsNotNone(fix)
+        self.assertIn("malloc", fix.minimal)
+        self.assertIn("free", fix.recommended)
+
+    def test_bitfield_fix(self):
+        """ビットフィールド符号修正案"""
+        msg = "ビットフィールド符号未指定: flagは1ビットで符号不定"
+        src = "    int flag : 1;"
+        fix = creview.generate_fix(msg, src)
+        self.assertIsNotNone(fix)
+        self.assertIn("unsigned int flag", fix.minimal)
+
+    def test_snprintf_fix(self):
+        """snprintf戻り値無視の修正案"""
+        msg = "snprintf戻り値無視。切り詰め未検出"
+        src = '    snprintf(buf, sizeof(buf), "hello");'
+        fix = creview.generate_fix(msg, src)
+        self.assertIsNotNone(fix)
+        self.assertIn("(void)", fix.minimal)
+        self.assertIn("int ret =", fix.recommended)
+
+    def test_unknown_returns_none(self):
+        """不明な指摘にはNone"""
+        fix = creview.generate_fix("未知の指摘メッセージ", "    x = 1;")
+        self.assertIsNone(fix)
+
+
+class TestFixFormatText(unittest.TestCase):
+    def test_fix_in_text_output(self):
+        """--fix指定時にtext出力に修正案が含まれる"""
+        import tempfile
+        src = '#include <stdlib.h>\nvoid f() {\n    char *p = malloc(100);\n}\n'
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.c', delete=False,
+                                          encoding='utf-8') as f:
+            f.write(src)
+            f.flush()
+            path = f.name
+        try:
+            ignore = creview.IgnoreConfig()
+            issues = creview.run_local_analysis(path, ignore,
+                                                 only_rules={"null_deref"})
+            self.assertTrue(len(issues) > 0)
+            output = creview.format_text(issues, fix=True)
+            self.assertIn("[最小修正]", output)
+            self.assertIn("[推奨修正]", output)
+        finally:
+            os.unlink(path)
+
+    def test_fix_in_markdown_output(self):
+        """--fix指定時にmarkdown出力に修正案が含まれる"""
+        import tempfile
+        src = '#include <stdlib.h>\nvoid f() {\n    char *p = malloc(100);\n}\n'
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.c', delete=False,
+                                          encoding='utf-8') as f:
+            f.write(src)
+            f.flush()
+            path = f.name
+        try:
+            ignore = creview.IgnoreConfig()
+            issues = creview.run_local_analysis(path, ignore,
+                                                 only_rules={"null_deref"})
+            output = creview.format_markdown(issues, path, fix=True)
+            self.assertIn("**最小修正:**", output)
+            self.assertIn("**推奨修正:**", output)
+        finally:
+            os.unlink(path)
+
+
 if __name__ == "__main__":
     unittest.main()
