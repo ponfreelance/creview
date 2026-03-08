@@ -1205,28 +1205,30 @@ class TestBufReport(unittest.TestCase):
 
 
 class TestTinyFunction(unittest.TestCase):
-    """check_tiny_function: 関数本体5バイト未満検出"""
+    """check_tiny_function: コンパイル後オブジェクトサイズ5バイト以下検出"""
+
+    def _run_tiny_check(self, src):
+        """tiny_functionルールのみで解析"""
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.c', delete=False,
+                                          encoding='utf-8') as f:
+            f.write(src)
+            f.flush()
+            path = f.name
+        try:
+            ignore = creview.IgnoreConfig()
+            return creview.run_local_analysis(path, ignore,
+                                              only_rules={"tiny_function"})
+        finally:
+            os.unlink(path)
 
     def test_empty_function_detected(self):
-        """空関数は検出される"""
+        """空関数はオブジェクトサイズが小さいため検出される"""
         src = """\
 void empty_func(void) {
 }
 """
-        issues = run_checks(src)
-        self.assertTrue(has_issue(issues, keyword="スタブまたは空関数"))
-
-    def test_tiny_stub_detected(self):
-        """return 0; のみの極小関数(4バイト)は検出"""
-        # "return0;" → 空白除去で8バイトだが、
-        # 実質は "return 0;" → "return0;" = 8バイト → 5以上なのでOK
-        # もっと小さい例: ";"のみ = 1バイト
-        src = """\
-int stub(void) {
-    ;
-}
-"""
-        issues = run_checks(src)
+        issues = self._run_tiny_check(src)
         self.assertTrue(has_issue(issues, keyword="スタブまたは空関数"))
 
     def test_normal_function_not_detected(self):
@@ -1234,11 +1236,42 @@ int stub(void) {
         src = """\
 int normal_func(int x) {
     int result = x * 2;
+    if (result > 100) {
+        result = 100;
+    }
     return result;
 }
 """
-        issues = run_checks(src)
+        issues = self._run_tiny_check(src)
         self.assertFalse(has_issue(issues, keyword="スタブまたは空関数"))
+
+    def test_obj_func_sizes_helper(self):
+        """_get_obj_func_sizes がコンパイル可能なファイルでサイズを返す"""
+        src = """\
+void tiny(void) {}
+int bigger(int x) {
+    int y = x * 2;
+    if (y > 100) y = 100;
+    return y;
+}
+"""
+        import tempfile
+        import shutil
+        if not shutil.which("gcc"):
+            self.skipTest("gcc not available")
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.c', delete=False,
+                                          encoding='utf-8') as f:
+            f.write(src)
+            f.flush()
+            path = f.name
+        try:
+            sizes = creview._get_obj_func_sizes(path)
+            self.assertIsNotNone(sizes)
+            self.assertIn("tiny", sizes)
+            self.assertIn("bigger", sizes)
+            self.assertLess(sizes["tiny"], sizes["bigger"])
+        finally:
+            os.unlink(path)
 
 
 class TestLinkage(unittest.TestCase):
@@ -1322,7 +1355,18 @@ void caller(void) {
     helper(42);
 }
 """
-        issues = run_checks(src)
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.c', delete=False,
+                                          encoding='utf-8') as f:
+            f.write(src)
+            f.flush()
+            path = f.name
+        try:
+            ignore = creview.IgnoreConfig()
+            issues = creview.run_local_analysis(path, ignore,
+                                                only_rules={"undefined_call"})
+        finally:
+            os.unlink(path)
         self.assertFalse(has_issue(issues, keyword="helper"))
 
     def test_extern_declared_not_detected(self):

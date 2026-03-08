@@ -1197,9 +1197,86 @@ def check_packed(fp, raw, cl, issues, ignore):
         i += 1
 
 
+def _get_obj_func_sizes(filepath: str) -> Optional[Dict[str, int]]:
+    """Cソースをgcc -cでコンパイルし、nm -Sで関数ごとのオブジェクトサイズを取得。
+    コンパイル失敗時はNoneを返す。"""
+    import tempfile
+    import shutil
+    # gccが使えるか確認
+    gcc = shutil.which("gcc")
+    if not gcc:
+        return None
+    obj_fd = None
+    obj_path = None
+    try:
+        obj_fd, obj_path = tempfile.mkstemp(suffix=".o")
+        os.close(obj_fd)
+        obj_fd = None
+        # -c: コンパイルのみ, -w: 警告抑制, -O2: 最適化で実質コードサイズを測定
+        result = subprocess.run(
+            [gcc, "-c", "-w", "-O2", "-o", obj_path, filepath],
+            capture_output=True, timeout=30)
+        if result.returncode != 0:
+            return None
+        # nm -S: シンボルサイズ表示, -t d: 10進数
+        nm_result = subprocess.run(
+            ["nm", "-S", "--defined-only", obj_path],
+            capture_output=True, text=True, timeout=10)
+        if nm_result.returncode != 0:
+            return None
+        sizes: Dict[str, int] = {}
+        # nm -S 出力: "addr size type name"
+        # 例: "0000000000000000 000000000000000b T func_name"
+        for line in nm_result.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 4 and parts[2] in ('T', 't'):
+                fname = parts[3]
+                try:
+                    size = int(parts[1], 16)
+                    sizes[fname] = size
+                except ValueError:
+                    pass
+        return sizes if sizes else None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    finally:
+        if obj_fd is not None:
+            try:
+                os.close(obj_fd)
+            except OSError:
+                pass
+        if obj_path and os.path.exists(obj_path):
+            try:
+                os.unlink(obj_path)
+            except OSError:
+                pass
+
+
 def check_tiny_function(fp, raw, cl, issues):
-    """関数本体が5バイト未満(空白・改行除く)の関数を検出。スタブ・空関数の疑い"""
+    """コンパイル後のオブジェクトサイズが5バイト未満の関数を検出。
+    スタブ・空関数・リンク事故の疑い。gcc未使用環境ではソース解析にフォールバック"""
+    # ソース行から関数定義の行番号マップを作成
     func_re = re.compile(r'^(\w[\w\s\*]*?)\s+(\w+)\s*\(')
+    func_lines: Dict[str, int] = {}
+    i = 0
+    while i < len(cl):
+        fm = func_re.match(cl[i])
+        if fm and '{' in cl[i]:
+            func_lines[fm.group(2)] = i + 1  # 1-indexed
+        i += 1
+
+    # オブジェクトサイズ取得を試行
+    obj_sizes = _get_obj_func_sizes(fp)
+    if obj_sizes is not None:
+        for fname, size in obj_sizes.items():
+            if size <= 5:
+                line = func_lines.get(fname, 0)
+                issues.append(Issue(Severity.MAINT, fp, line,
+                    f"関数{fname}: オブジェクトサイズ{size}バイト(5バイト以下)。"
+                    f"スタブまたは空関数の疑い"))
+        return
+
+    # フォールバック: ソースコード解析(gcc無い環境向け)
     i = 0
     while i < len(cl):
         fm = func_re.match(cl[i])
@@ -1207,25 +1284,22 @@ def check_tiny_function(fp, raw, cl, issues):
             i += 1
             continue
         func_name = fm.group(2)
-        # main/コールバック登録用の空関数は除外しない
         brace = 0
         body_chars = []
         func_start = i
         for j in range(i, len(cl)):
             brace += cl[j].count('{') - cl[j].count('}')
             if j > i:
-                # 本体行(開き・閉じブレースのみの行は除外)
                 stripped = cl[j].strip().rstrip('}').strip()
                 if stripped:
                     body_chars.append(stripped)
             if brace <= 0 and j > i:
                 body_text = "".join(body_chars)
-                # 空白除去した実質バイト数
                 effective = len(re.sub(r'\s+', '', body_text))
                 if effective < 5:
                     issues.append(Issue(Severity.MAINT, fp, func_start + 1,
-                        f"関数{func_name}: 本体が{effective}バイト。"
-                        f"スタブまたは空関数の疑い"))
+                        f"関数{func_name}: 本体が{effective}バイト(ソース解析)。"
+                        f"スタブまたは空関数の疑い(gcc未検出のためソース解析)"))
                 i = j
                 break
         i += 1
