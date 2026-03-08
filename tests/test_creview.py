@@ -1069,5 +1069,140 @@ class TestStackReport(unittest.TestCase):
         self.assertIn("再帰", report)
 
 
+class TestResolveSizeExpr(unittest.TestCase):
+    def test_numeric(self):
+        self.assertEqual(creview._resolve_size_expr("256", {}), 256)
+
+    def test_sizeof_known(self):
+        self.assertEqual(creview._resolve_size_expr("sizeof(buf)", {"buf": 1024}), 1024)
+
+    def test_sizeof_minus(self):
+        self.assertEqual(creview._resolve_size_expr("sizeof(buf) - 1", {"buf": 64}), 63)
+
+    def test_unknown(self):
+        self.assertEqual(creview._resolve_size_expr("len", {}), -1)
+
+
+class TestBufUsage(unittest.TestCase):
+    def _analyze(self, src):
+        raw = src.split("\n")
+        cl = creview.strip_comments_and_strings(src)
+        return creview.analyze_buf_usage("test.c", raw, cl)
+
+    def test_snprintf_bounded(self):
+        """snprintfのサイズ制限を検出"""
+        src = 'void f() {\n    char buf[1024];\n    snprintf(buf, 256, "hello");\n}\n'
+        infos = self._analyze(src)
+        self.assertEqual(len(infos), 1)
+        self.assertEqual(infos[0].name, "buf")
+        self.assertEqual(infos[0].decl_size, 1024)
+        self.assertEqual(infos[0].max_write, 256)
+        self.assertAlmostEqual(infos[0].usage_pct, 25.0, places=0)
+
+    def test_snprintf_sizeof(self):
+        """snprintfでsizeof使用時、100%"""
+        src = 'void f() {\n    char buf[64];\n    snprintf(buf, sizeof(buf), "x");\n}\n'
+        infos = self._analyze(src)
+        self.assertEqual(len(infos), 1)
+        self.assertEqual(infos[0].max_write, 64)
+        self.assertAlmostEqual(infos[0].usage_pct, 100.0, places=0)
+
+    def test_strcpy_unbounded(self):
+        """strcpyは不定"""
+        src = 'void f(char *s) {\n    char buf[64];\n    strcpy(buf, s);\n}\n'
+        infos = self._analyze(src)
+        self.assertEqual(len(infos), 1)
+        self.assertEqual(infos[0].max_write, -1)
+        self.assertLess(infos[0].usage_pct, 0)
+
+    def test_strcpy_literal(self):
+        """strcpyでリテラルコピーはサイズ判定可能"""
+        src = 'void f() {\n    char buf[64];\n    strcpy(buf, "hello");\n}\n'
+        infos = self._analyze(src)
+        self.assertEqual(len(infos), 1)
+        # "hello" = 5文字 + NUL = 6バイト
+        self.assertEqual(infos[0].max_write, 6)
+
+    def test_strncpy_sizeof_minus_1(self):
+        """strncpy(buf, src, sizeof(buf)-1)の解決"""
+        src = 'void f(char *s) {\n    char buf[128];\n    strncpy(buf, s, sizeof(buf) - 1);\n}\n'
+        infos = self._analyze(src)
+        self.assertEqual(len(infos), 1)
+        self.assertEqual(infos[0].max_write, 127)
+
+    def test_memcpy_fixed(self):
+        """memcpy固定サイズ"""
+        src = 'void f() {\n    char buf[256];\n    memcpy(buf, "data", 32);\n}\n'
+        infos = self._analyze(src)
+        self.assertEqual(len(infos), 1)
+        self.assertEqual(infos[0].max_write, 32)
+        self.assertAlmostEqual(infos[0].usage_pct, 12.5, places=0)
+
+    def test_read_sizeof(self):
+        """readでsizeof使用"""
+        src = 'void f() {\n    char buf[4096];\n    read(0, buf, sizeof(buf));\n}\n'
+        infos = self._analyze(src)
+        self.assertEqual(len(infos), 1)
+        self.assertEqual(infos[0].max_write, 4096)
+        self.assertAlmostEqual(infos[0].usage_pct, 100.0, places=0)
+
+    def test_fgets_bounded(self):
+        """fgetsのサイズ制限"""
+        src = 'void f() {\n    char line[256];\n    fgets(line, sizeof(line), stdin);\n}\n'
+        infos = self._analyze(src)
+        self.assertEqual(len(infos), 1)
+        self.assertEqual(infos[0].max_write, 256)
+
+    def test_multiple_writes_max(self):
+        """複数書き込みの最大値を使用"""
+        src = ('void f() {\n    char buf[1024];\n'
+               '    snprintf(buf, 100, "a");\n'
+               '    snprintf(buf, 500, "b");\n}\n')
+        infos = self._analyze(src)
+        self.assertEqual(len(infos), 1)
+        self.assertEqual(infos[0].max_write, 500)
+        self.assertEqual(len(infos[0].writes), 2)
+
+    def test_no_writes_skipped(self):
+        """書き込みなしのバッファはスキップ"""
+        src = 'void f() {\n    char buf[64];\n}\n'
+        infos = self._analyze(src)
+        self.assertEqual(len(infos), 0)
+
+    def test_sprintf_unbounded(self):
+        """sprintfは不定"""
+        src = 'void f(char *s) {\n    char buf[64];\n    sprintf(buf, "%s", s);\n}\n'
+        infos = self._analyze(src)
+        self.assertEqual(len(infos), 1)
+        self.assertLess(infos[0].usage_pct, 0)
+
+
+class TestBufReport(unittest.TestCase):
+    def test_report_format(self):
+        """レポートフォーマット"""
+        infos = [
+            creview.BufInfo("buf", 5, 1024, 1,
+                            [creview.BufWrite(10, "snprintf", 256, "snprintf(buf, 256, ...);")],
+                            256, 25.0),
+        ]
+        report = creview.format_buf_report("test.c", infos)
+        self.assertIn("buf", report)
+        self.assertIn("1,024B", report)
+        self.assertIn("256B", report)
+        self.assertIn("25%", report)
+        self.assertIn("バッファ使用率", report)
+
+    def test_report_unbounded(self):
+        """不定バッファの表示"""
+        infos = [
+            creview.BufInfo("danger", 5, 64, 1,
+                            [creview.BufWrite(10, "strcpy", -1, "strcpy(danger, input);")],
+                            -1, -1.0),
+        ]
+        report = creview.format_buf_report("test.c", infos)
+        self.assertIn("!!危険", report)
+        self.assertIn("不定", report)
+
+
 if __name__ == "__main__":
     unittest.main()

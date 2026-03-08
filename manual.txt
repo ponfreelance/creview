@@ -1,5 +1,5 @@
 ============================================
-C設計レビューAI  CReview v0.12.0
+C設計レビューAI  CReview v0.13.0
 ============================================
 
 
@@ -297,6 +297,44 @@ critical / design / maint から選択。
 --stack-threshold オプション:
   デフォルトは8192バイト。組み込み環境等では小さく設定可能:
     creview --stack --stack-threshold 1024 --local-only src/
+
+
+■ バッファ使用率解析 (--buf-usage)
+--------------------------------------------
+
+  creview --buf-usage --local-only src/
+
+バッファ(配列)の宣言サイズに対し、各書き込み操作が最大何バイト
+使用するかを解析し、使用率として表示。
+
+出力例:
+  ── バッファ使用率: main.c ──
+  バッファ           宣言      最大書込   使用率  操作
+  ──────────────────────────────────────────────────
+  big_buf        4,096B      256B       6%  snprintf
+    L12: snprintf  最大256B
+  small_buf         64B       64B     100%  fgets, strncpy
+    L15: strncpy  最大63B
+    L21: fgets  最大64B
+  tiny              16B       不定  !!危険  strcpy
+    L24: strcpy  不定(危険)
+  ──────────────────────────────────────────────────
+  バッファ数: 3  安全: 1  超過: 0  不定: 1
+
+追跡する書き込み操作:
+  安全系 (サイズ制限あり):
+    snprintf, strncpy, memcpy, memmove, memset,
+    read, recv, fgets, fread
+  危険系 (サイズ制限なし):
+    sprintf, strcpy, strcat, gets
+  リテラルコピー:
+    strcpy(buf, "hello") → 6バイトと判定
+
+サイズ式の解決:
+  sizeof(buf), sizeof(buf) - 1, 数値リテラル, A * B
+
+--stackと併用で、スタック使用量+バッファ使用率を同時確認可能:
+  creview --stack --buf-usage --local-only src/
 
 
 ■ ベースライン差分

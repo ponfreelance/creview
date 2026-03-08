@@ -20,7 +20,7 @@ from fnmatch import fnmatch
 import subprocess
 
 # ─── バージョン / 定数 ────────────────────────────────
-VERSION = "0.12.0"
+VERSION = "0.13.0"
 IGNOREFILE = ".creviewignore"
 CONFIGFILE = "config.txt"
 MAX_CHUNK_BYTES = 80_000
@@ -1491,6 +1491,300 @@ def format_stack_report(filepath: str, stack_infos: List[StackInfo]) -> str:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# バッファ使用率解析 (--buf-usage)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@dataclass
+class BufWrite:
+    line: int
+    operation: str     # "snprintf", "read", etc.
+    max_bytes: int     # 最大書き込みバイト数 (-1=不定)
+    source_line: str   # 元ソース行
+
+
+@dataclass
+class BufInfo:
+    name: str
+    decl_line: int
+    decl_size: int       # 宣言サイズ(バイト)
+    elem_size: int       # 要素サイズ
+    writes: List[BufWrite]
+    max_write: int       # 全書き込みの最大値 (-1=不定)
+    usage_pct: float     # 使用率% (-1=不定)
+
+
+def _resolve_size_expr(expr: str, buf_sizes: Dict[str, int]) -> int:
+    """サイズ式を解決。sizeof(buf)やbuf_sizeなどを定数に変換"""
+    s = expr.strip()
+    # sizeof(buf) - N パターン (sizeof単体より先に判定)
+    m = re.match(r'sizeof\s*\(\s*(\w+)\s*\)\s*-\s*(\d+)', s)
+    if m:
+        var = m.group(1)
+        sub = int(m.group(2))
+        if var in buf_sizes:
+            return buf_sizes[var] - sub
+    # sizeof(var) パターン
+    m = re.match(r'sizeof\s*\(\s*(\w+)\s*\)$', s)
+    if m:
+        var = m.group(1)
+        if var in buf_sizes:
+            return buf_sizes[var]
+        sz = _get_type_size(var)
+        if sz > 0:
+            return sz
+        return -1
+    # 数値リテラル
+    try:
+        return int(s)
+    except ValueError:
+        pass
+    # 16進
+    if s.startswith("0x") or s.startswith("0X"):
+        try:
+            return int(s, 16)
+        except ValueError:
+            pass
+    # 乗算 A * B
+    m = re.match(r'(\w+)\s*\*\s*(\w+)$', s)
+    if m:
+        a = _resolve_size_expr(m.group(1), buf_sizes)
+        b = _resolve_size_expr(m.group(2), buf_sizes)
+        if a > 0 and b > 0:
+            return a * b
+    # 変数名 → 不定
+    return -1
+
+
+def analyze_buf_usage(filepath: str, raw: List[str],
+                      cl: List[str]) -> List[BufInfo]:
+    """ファイル内のバッファ宣言と書き込み操作を解析"""
+    results: List[BufInfo] = []
+
+    # Step 1: バッファ(配列)宣言を収集
+    buf_decls: Dict[str, Tuple[int, int, int]] = {}  # name → (line, total_bytes, elem_size)
+    arr_decl_re = re.compile(
+        r'(?:(?:const|volatile|static|register)\s+)*'
+        r'(?:(?:unsigned|signed)\s+)?'
+        r'(char|short|int|long|float|double|uint8_t|int8_t|'
+        r'uint16_t|int16_t|uint32_t|int32_t|uint64_t|int64_t|'
+        r'unsigned\s+char|signed\s+char)'
+        r'(?:\s*\*)*'
+        r'\s+(\w+)\s*\[\s*([^\]]+)\s*\]\s*[;=]'
+    )
+
+    for i, line in enumerate(cl):
+        m = arr_decl_re.search(line.strip())
+        if m:
+            type_str = m.group(1)
+            buf_name = m.group(2)
+            size_expr = m.group(3)
+            elem_sz = _get_type_size(type_str)
+            if elem_sz == 0:
+                elem_sz = 1
+            arr_size = _parse_array_size(size_expr)
+            if arr_size is not None and arr_size > 0:
+                total = elem_sz * arr_size
+                buf_decls[buf_name] = (i + 1, total, elem_sz)
+
+    if not buf_decls:
+        return results
+
+    # buf_sizes マップ (sizeof解決用)
+    buf_sizes: Dict[str, int] = {name: info[1] for name, info in buf_decls.items()}
+
+    # Step 2: 各バッファへの書き込み操作を検出
+    buf_writes: Dict[str, List[BufWrite]] = {name: [] for name in buf_decls}
+
+    for i, line in enumerate(cl):
+        stripped = line.strip()
+        raw_line = raw[i].strip() if i < len(raw) else ""
+
+        for buf_name in buf_decls:
+            # snprintf(buf, size, ...)
+            m = re.search(rf'\bsnprintf\s*\(\s*{re.escape(buf_name)}\s*,\s*([^,]+)\s*,',
+                          stripped)
+            if m:
+                sz = _resolve_size_expr(m.group(1), buf_sizes)
+                buf_writes[buf_name].append(
+                    BufWrite(i + 1, "snprintf", sz, raw_line))
+                continue
+
+            # strncpy(buf, src, size)
+            m = re.search(rf'\bstrncpy\s*\(\s*{re.escape(buf_name)}\s*,\s*[^,]+\s*,\s*([^,;]+?)\s*\)\s*;',
+                          stripped)
+            if m:
+                sz = _resolve_size_expr(m.group(1), buf_sizes)
+                buf_writes[buf_name].append(
+                    BufWrite(i + 1, "strncpy", sz, raw_line))
+                continue
+
+            # memcpy(buf, src, size) / memmove
+            m = re.search(rf'\b(memcpy|memmove)\s*\(\s*{re.escape(buf_name)}\s*,\s*[^,]+\s*,\s*([^,;]+?)\s*\)\s*;',
+                          stripped)
+            if m:
+                sz = _resolve_size_expr(m.group(2), buf_sizes)
+                buf_writes[buf_name].append(
+                    BufWrite(i + 1, m.group(1), sz, raw_line))
+                continue
+
+            # memset(buf, val, size)
+            m = re.search(rf'\bmemset\s*\(\s*{re.escape(buf_name)}\s*,\s*[^,]+\s*,\s*([^,;]+?)\s*\)\s*;',
+                          stripped)
+            if m:
+                sz = _resolve_size_expr(m.group(1), buf_sizes)
+                buf_writes[buf_name].append(
+                    BufWrite(i + 1, "memset", sz, raw_line))
+                continue
+
+            # read(fd, buf, size) / recv(sock, buf, size, ...)
+            m = re.search(rf'\b(read|recv)\s*\(\s*[^,]+\s*,\s*{re.escape(buf_name)}\s*,\s*(\w+(?:\s*\([^)]*\))?(?:\s*[+\-*/]\s*\d+)?)',
+                          stripped)
+            if m:
+                sz = _resolve_size_expr(m.group(2), buf_sizes)
+                buf_writes[buf_name].append(
+                    BufWrite(i + 1, m.group(1), sz, raw_line))
+                continue
+
+            # fgets(buf, size, fp)
+            m = re.search(rf'\bfgets\s*\(\s*{re.escape(buf_name)}\s*,\s*([^,]+)\s*,',
+                          stripped)
+            if m:
+                sz = _resolve_size_expr(m.group(1), buf_sizes)
+                buf_writes[buf_name].append(
+                    BufWrite(i + 1, "fgets", sz, raw_line))
+                continue
+
+            # fread(buf, elem_size, count, fp)
+            m = re.search(rf'\bfread\s*\(\s*{re.escape(buf_name)}\s*,\s*([^,]+)\s*,\s*([^,]+)\s*,',
+                          stripped)
+            if m:
+                es = _resolve_size_expr(m.group(1), buf_sizes)
+                cnt = _resolve_size_expr(m.group(2), buf_sizes)
+                sz = es * cnt if es > 0 and cnt > 0 else -1
+                buf_writes[buf_name].append(
+                    BufWrite(i + 1, "fread", sz, raw_line))
+                continue
+
+            # sprintf(buf, ...) - サイズ制限なし
+            m = re.search(rf'\bsprintf\s*\(\s*{re.escape(buf_name)}\s*,', stripped)
+            if m:
+                buf_writes[buf_name].append(
+                    BufWrite(i + 1, "sprintf", -1, raw_line))
+                continue
+
+            # strcpy(buf, src) - リテラルならサイズ判定可能
+            m = re.search(rf'\bstrcpy\s*\(\s*{re.escape(buf_name)}\s*,', stripped)
+            if m:
+                # raw行でリテラルチェック
+                m_lit = re.search(
+                    rf'\bstrcpy\s*\(\s*{re.escape(buf_name)}\s*,\s*"([^"]*)"',
+                    raw_line)
+                if m_lit:
+                    sz = len(m_lit.group(1)) + 1  # +NUL
+                else:
+                    sz = -1
+                buf_writes[buf_name].append(
+                    BufWrite(i + 1, "strcpy", sz, raw_line))
+                continue
+
+            # strcat(buf, src) - サイズ制限なし
+            m = re.search(rf'\bstrcat\s*\(\s*{re.escape(buf_name)}\s*,', stripped)
+            if m:
+                buf_writes[buf_name].append(
+                    BufWrite(i + 1, "strcat", -1, raw_line))
+                continue
+
+            # gets(buf) - サイズ制限なし
+            m = re.search(rf'\bgets\s*\(\s*{re.escape(buf_name)}\s*\)', stripped)
+            if m:
+                buf_writes[buf_name].append(
+                    BufWrite(i + 1, "gets", -1, raw_line))
+                continue
+
+    # Step 3: 結果集計
+    for buf_name, (decl_line, decl_size, elem_sz) in buf_decls.items():
+        writes = buf_writes[buf_name]
+        if not writes:
+            continue  # 書き込みなしのバッファはスキップ
+
+        max_write = -1
+        has_unbounded = False
+        for w in writes:
+            if w.max_bytes == -1:
+                has_unbounded = True
+            elif max_write == -1 or w.max_bytes > max_write:
+                max_write = w.max_bytes
+
+        if has_unbounded:
+            usage_pct = -1.0  # 不定
+            if max_write == -1:
+                max_write = -1
+        else:
+            usage_pct = (max_write / decl_size * 100) if decl_size > 0 else -1.0
+
+        results.append(BufInfo(
+            name=buf_name,
+            decl_line=decl_line,
+            decl_size=decl_size,
+            elem_size=elem_sz,
+            writes=writes,
+            max_write=max_write,
+            usage_pct=usage_pct,
+        ))
+
+    results.sort(key=lambda b: b.decl_line)
+    return results
+
+
+def format_buf_report(filepath: str, buf_infos: List[BufInfo]) -> str:
+    """--buf-usage用: バッファ使用率レポート"""
+    if not buf_infos:
+        return ""
+
+    lines = [f"── バッファ使用率: {filepath} ──"]
+    lines.append(f"{'バッファ':<20} {'宣言':>8}  {'最大書込':>8}  {'使用率':>7}  {'操作'}")
+    lines.append("─" * 75)
+
+    for buf in buf_infos:
+        decl_str = f"{buf.decl_size:,}B"
+
+        if buf.max_write == -1:
+            max_str = "不定"
+            pct_str = "!!危険"
+        else:
+            max_str = f"{buf.max_write:,}B"
+            if buf.usage_pct < 0:
+                pct_str = "不定"
+            elif buf.usage_pct > 100:
+                pct_str = f"{buf.usage_pct:.0f}% !!"
+            else:
+                pct_str = f"{buf.usage_pct:.0f}%"
+
+        ops = set(w.operation for w in buf.writes)
+        ops_str = ", ".join(sorted(ops))
+
+        lines.append(f"{buf.name:<20} {decl_str:>8}  {max_str:>8}  {pct_str:>7}  {ops_str}")
+
+        # 書き込み詳細
+        for w in buf.writes:
+            if w.max_bytes == -1:
+                sz_detail = "不定(危険)"
+            else:
+                sz_detail = f"最大{w.max_bytes:,}B"
+            lines.append(f"  L{w.line}: {w.operation}  {sz_detail}")
+
+    # サマリー
+    safe = sum(1 for b in buf_infos if 0 <= b.usage_pct <= 100)
+    over = sum(1 for b in buf_infos if b.usage_pct > 100)
+    unbounded = sum(1 for b in buf_infos if b.usage_pct < 0)
+    lines.append("─" * 75)
+    lines.append(f"バッファ数: {len(buf_infos)}  "
+                 f"安全: {safe}  超過: {over}  不定: {unbounded}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Phase 1: ローカル静的解析エンジン
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -2833,6 +3127,8 @@ def main():
     parser.add_argument("--stack-threshold", type=int,
                         default=DEFAULT_STACK_THRESHOLD,
                         help=f"スタック超過閾値バイト(デフォルト{DEFAULT_STACK_THRESHOLD})")
+    parser.add_argument("--buf-usage", action="store_true",
+                        help="バッファ宣言サイズに対する書き込み使用率レポート")
     parser.add_argument("--baseline",
                         help="ベースラインJSONファイル。新規指摘のみ表示")
     parser.add_argument("--exit-code",
@@ -2996,16 +3292,21 @@ def main():
                     print(format_text(local_issues, fix_hint=use_hint,
                                        fix=use_fix, similar_map=sim_map))
 
-        # --stack: 関数別スタック使用量レポート
-        if args.stack:
+        # --stack / --buf-usage: 解析レポート
+        if args.stack or args.buf_usage:
             try:
                 with open(fpath, "r", encoding="utf-8", errors="replace") as sf:
-                    stack_src = sf.read()
-                stack_raw = stack_src.split("\n")
-                stack_cl = strip_comments_and_strings(stack_src)
-                stack_infos = analyze_file_stack(fpath, stack_raw, stack_cl)
-                if stack_infos:
-                    print(format_stack_report(fpath, stack_infos))
+                    report_src = sf.read()
+                report_raw = report_src.split("\n")
+                report_cl = strip_comments_and_strings(report_src)
+                if args.stack:
+                    stack_infos = analyze_file_stack(fpath, report_raw, report_cl)
+                    if stack_infos:
+                        print(format_stack_report(fpath, stack_infos))
+                if args.buf_usage:
+                    buf_infos = analyze_buf_usage(fpath, report_raw, report_cl)
+                    if buf_infos:
+                        print(format_buf_report(fpath, buf_infos))
             except OSError:
                 pass
 
