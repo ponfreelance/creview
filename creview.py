@@ -1232,7 +1232,8 @@ def _get_obj_func_sizes(filepath: str) -> Optional[Dict[str, int]]:
         # シンボル解析: アドレス順ソートして隣接アドレス差からサイズ計算
         # GNU nm -S: "addr size type name" (4列)
         # macOS/BSD nm: "addr type name" (3列, サイズなし)
-        symbols = []  # [(addr, type, name)]
+        # ltmp等の内部ラベルもアドレス境界として収集し、最終結果からは除外
+        all_symbols = []  # [(addr, fname, size, is_user)]
         has_size_col = False
         for line in nm_result.stdout.splitlines():
             parts = line.split()
@@ -1242,15 +1243,13 @@ def _get_obj_func_sizes(filepath: str) -> Optional[Dict[str, int]]:
                 # macOS: シンボル名の先頭 _ を除去
                 if fname.startswith('_'):
                     fname = fname[1:]
-                # コンパイラ内部ラベル(ltmp等)を除外
-                if fname.startswith('ltmp'):
-                    continue
+                is_user = not fname.startswith('ltmp')
                 try:
                     addr = int(parts[0], 16)
                     size = int(parts[1], 16)
-                    if size > 0:
+                    if size > 0 and is_user:
                         has_size_col = True
-                    symbols.append((addr, fname, size))
+                    all_symbols.append((addr, fname, size, is_user))
                 except ValueError:
                     pass
             elif len(parts) >= 3 and parts[1] in ('T', 't'):
@@ -1258,34 +1257,38 @@ def _get_obj_func_sizes(filepath: str) -> Optional[Dict[str, int]]:
                 fname = parts[2]
                 if fname.startswith('_'):
                     fname = fname[1:]
-                # コンパイラ内部ラベル(ltmp等)を除外
-                if fname.startswith('ltmp'):
-                    continue
+                is_user = not fname.startswith('ltmp')
                 try:
                     addr = int(parts[0], 16)
-                    symbols.append((addr, fname, 0))
+                    all_symbols.append((addr, fname, 0, is_user))
                 except ValueError:
                     pass
-        if not symbols:
+        if not any(s[3] for s in all_symbols):
             return None
         # GNU nmでサイズ列が有効ならそのまま使用
         if has_size_col:
             sizes: Dict[str, int] = {}
-            for _, fname, size in symbols:
-                # コンパイラ内部ラベルを除外
-                if not fname.startswith('ltmp'):
+            for _, fname, size, is_user in all_symbols:
+                if is_user:
                     sizes[fname] = size
             return sizes if sizes else None
-        # サイズ列がない場合: アドレス順でソートし隣接差から推定
-        symbols.sort(key=lambda s: s[0])
+        # サイズ列がない場合: 全シンボルをアドレス順ソートし隣接差から推定
+        all_symbols.sort(key=lambda s: s[0])
         sizes = {}
-        for idx, (addr, fname, _) in enumerate(symbols):
-            if idx + 1 < len(symbols):
-                next_addr = symbols[idx + 1][0]
+        for idx, (addr, fname, _, is_user) in enumerate(all_symbols):
+            if not is_user:
+                continue
+            # 次のシンボル(内部ラベル含む)のアドレスとの差でサイズ推定
+            next_addr = None
+            for j in range(idx + 1, len(all_symbols)):
+                if all_symbols[j][0] > addr:
+                    next_addr = all_symbols[j][0]
+                    break
+            if next_addr is not None:
                 sizes[fname] = next_addr - addr
             else:
-                # 最後のシンボル: サイズ不明→大きめに見積もる(検出回避)
-                sizes[fname] = 100
+                # 最後のシンボル: サイズ不明→フォールバック解析に委ねる
+                sizes[fname] = 0
         return sizes if sizes else None
     except (OSError, subprocess.TimeoutExpired):
         return None
