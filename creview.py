@@ -1197,6 +1197,166 @@ def check_packed(fp, raw, cl, issues, ignore):
         i += 1
 
 
+def check_tiny_function(fp, raw, cl, issues):
+    """関数本体が5バイト未満(空白・改行除く)の関数を検出。スタブ・空関数の疑い"""
+    func_re = re.compile(r'^(\w[\w\s\*]*?)\s+(\w+)\s*\(')
+    i = 0
+    while i < len(cl):
+        fm = func_re.match(cl[i])
+        if not fm or '{' not in cl[i]:
+            i += 1
+            continue
+        func_name = fm.group(2)
+        # main/コールバック登録用の空関数は除外しない
+        brace = 0
+        body_chars = []
+        func_start = i
+        for j in range(i, len(cl)):
+            brace += cl[j].count('{') - cl[j].count('}')
+            if j > i:
+                # 本体行(開き・閉じブレースのみの行は除外)
+                stripped = cl[j].strip().rstrip('}').strip()
+                if stripped:
+                    body_chars.append(stripped)
+            if brace <= 0 and j > i:
+                body_text = "".join(body_chars)
+                # 空白除去した実質バイト数
+                effective = len(re.sub(r'\s+', '', body_text))
+                if effective < 5:
+                    issues.append(Issue(Severity.MAINT, fp, func_start + 1,
+                        f"関数{func_name}: 本体が{effective}バイト。"
+                        f"スタブまたは空関数の疑い"))
+                i = j
+                break
+        i += 1
+
+
+def check_linkage(fp, raw, cl, issues):
+    """extern宣言に対応する定義が同一ファイル内に存在するか簡易チェック。
+    ヘッダファイル(.h)ではスキップ(宣言のみが正常)"""
+    if fp.endswith('.h'):
+        return
+    extern_re = re.compile(
+        r'\bextern\s+[\w\s\*]+\b(\w+)\s*\(')
+    for i, line in enumerate(cl):
+        m = extern_re.search(line)
+        if not m:
+            continue
+        func_name = m.group(1)
+        # 同一ファイル内に定義(extern無し)があるか
+        def_pat = re.compile(
+            rf'^(?!.*\bextern\b)\w[\w\s\*]*\b{re.escape(func_name)}\s*\([^)]*\)\s*\{{')
+        found = False
+        for k, dl in enumerate(cl):
+            if k == i:
+                continue
+            if def_pat.match(dl):
+                found = True
+                break
+        if not found:
+            # プロトタイプ宣言のみは許容(extern宣言として正常)
+            # ただし.cファイル内のexternは外部依存を示す → リンケージ警告
+            issues.append(Issue(Severity.MAINT, fp, i + 1,
+                f"extern宣言 {func_name}() の定義が同一ファイル内になし。"
+                f"リンク時に未解決シンボルの可能性"))
+
+
+def check_undefined_call(fp, raw, cl, issues):
+    """呼び出し関数がファイル内で宣言・定義されていないパターン検出。
+    標準ライブラリ・POSIX関数は除外"""
+    # 標準・POSIX関数(よく使われるもの)
+    KNOWN_FUNCS = {
+        # stdio
+        "printf", "fprintf", "sprintf", "snprintf", "scanf", "fscanf",
+        "sscanf", "puts", "fputs", "fgets", "gets", "putchar", "getchar",
+        "fopen", "fclose", "fread", "fwrite", "fseek", "ftell", "rewind",
+        "fflush", "feof", "ferror", "perror", "remove", "rename", "tmpfile",
+        "setbuf", "setvbuf", "vprintf", "vfprintf", "vsprintf", "vsnprintf",
+        # stdlib
+        "malloc", "calloc", "realloc", "free", "abort", "exit", "_exit",
+        "atexit", "atoi", "atol", "atof", "strtol", "strtoul", "strtoll",
+        "strtoull", "strtod", "strtof", "abs", "labs", "llabs", "div",
+        "rand", "srand", "qsort", "bsearch", "getenv", "system",
+        # string
+        "memcpy", "memmove", "memset", "memcmp", "memchr",
+        "strcpy", "strncpy", "strcat", "strncat", "strcmp", "strncmp",
+        "strchr", "strrchr", "strstr", "strtok", "strlen", "strerror",
+        "strdup", "strndup", "strnlen", "strcasecmp", "strncasecmp",
+        # ctype
+        "isalpha", "isdigit", "isalnum", "isspace", "isupper", "islower",
+        "toupper", "tolower", "isprint", "isxdigit",
+        # math
+        "sin", "cos", "tan", "sqrt", "pow", "log", "log10", "exp",
+        "ceil", "floor", "fabs", "fmod", "round",
+        # POSIX
+        "open", "close", "read", "write", "lseek", "stat", "fstat",
+        "lstat", "access", "unlink", "mkdir", "rmdir", "opendir",
+        "readdir", "closedir", "fork", "exec", "execl", "execv",
+        "execvp", "execlp", "wait", "waitpid", "pipe", "dup", "dup2",
+        "socket", "bind", "listen", "accept", "connect", "send", "recv",
+        "sendto", "recvfrom", "select", "poll", "epoll_create",
+        "epoll_ctl", "epoll_wait", "setsockopt", "getsockopt",
+        "getaddrinfo", "freeaddrinfo", "gai_strerror",
+        "pthread_create", "pthread_join", "pthread_detach",
+        "pthread_mutex_init", "pthread_mutex_lock", "pthread_mutex_unlock",
+        "pthread_mutex_destroy", "pthread_cond_init", "pthread_cond_wait",
+        "pthread_cond_signal", "pthread_cond_broadcast",
+        "signal", "sigaction", "kill", "raise", "alarm",
+        "mmap", "munmap", "mprotect", "shmget", "shmat", "shmdt",
+        "sem_init", "sem_wait", "sem_post", "sem_destroy",
+        "clock_gettime", "nanosleep", "usleep", "sleep", "time",
+        "localtime", "gmtime", "strftime", "difftime", "mktime",
+        "syslog", "openlog", "closelog",
+        "ioctl", "fcntl",
+        # assert
+        "assert",
+        # setjmp
+        "setjmp", "longjmp",
+        # errno
+        "errno",
+    }
+    # ファイル内の関数定義・宣言を収集
+    func_def_re = re.compile(r'^(\w[\w\s\*]*?)\s+(\w+)\s*\(')
+    declared_funcs: Set[str] = set()
+    for line in cl:
+        m = func_def_re.match(line)
+        if m:
+            declared_funcs.add(m.group(2))
+    # extern宣言も収集
+    extern_re = re.compile(r'\bextern\s+[\w\s\*]+\b(\w+)\s*\(')
+    for line in cl:
+        m = extern_re.search(line)
+        if m:
+            declared_funcs.add(m.group(1))
+    # #include先のヘッダで宣言されている可能性 → 関数呼び出しで宣言も定義もないものを検出
+    # マクロ呼び出しは大文字のみのものとして除外
+    call_re = re.compile(r'\b([a-z_]\w*)\s*\(')
+    # 型キャストパターン除外
+    cast_types = {"int", "char", "long", "short", "float", "double",
+                  "unsigned", "signed", "void", "size_t", "ssize_t",
+                  "uint8_t", "uint16_t", "uint32_t", "uint64_t",
+                  "int8_t", "int16_t", "int32_t", "int64_t",
+                  "if", "while", "for", "switch", "return", "sizeof",
+                  "typeof", "alignof", "offsetof"}
+    reported: Set[str] = set()
+    for i, line in enumerate(cl):
+        for m in call_re.finditer(line):
+            fname = m.group(1)
+            if fname in cast_types:
+                continue
+            if fname in KNOWN_FUNCS:
+                continue
+            if fname in declared_funcs:
+                continue
+            if fname in reported:
+                continue
+            # マクロ(大文字+アンダースコアのみ)は除外済み(小文字始まりのみ対象)
+            reported.add(fname)
+            issues.append(Issue(Severity.MAINT, fp, i + 1,
+                f"関数{fname}()の宣言・定義がファイル内に見つからない。"
+                f"ヘッダinclude漏れまたはリンクエラーの可能性"))
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # スタックサイズ推定
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1840,6 +2000,9 @@ def run_local_analysis(filepath: str, ignore: IgnoreConfig,
         ("goto_misuse",         lambda: check_goto_misuse(filepath, raw, cl, issues)),
         ("stack_usage",         lambda: check_stack_usage(filepath, raw, cl, issues,
                                                             threshold=stack_threshold)),
+        ("tiny_function",       lambda: check_tiny_function(filepath, raw, cl, issues)),
+        ("linkage",             lambda: check_linkage(filepath, raw, cl, issues)),
+        ("undefined_call",      lambda: check_undefined_call(filepath, raw, cl, issues)),
     ]
     for rule_name, check_fn in checks:
         if rule_name in off:
@@ -2780,7 +2943,7 @@ PRESETS = {
         "description": "コーディング規約・保守性チェック",
         "rules": {"globals", "macros", "magic_numbers", "snprintf_retval",
                   "recursive_no_limit", "goto_misuse", "switch_fallthrough",
-                  "enum_switch"},
+                  "enum_switch", "tiny_function", "linkage", "undefined_call"},
     },
     "pr": {
         "description": "PR前チェック (diff + fix-hint有効化)",

@@ -1204,5 +1204,139 @@ class TestBufReport(unittest.TestCase):
         self.assertIn("不定", report)
 
 
+class TestTinyFunction(unittest.TestCase):
+    """check_tiny_function: 関数本体5バイト未満検出"""
+
+    def test_empty_function_detected(self):
+        """空関数は検出される"""
+        src = """\
+void empty_func(void) {
+}
+"""
+        issues = run_checks(src)
+        self.assertTrue(has_issue(issues, keyword="スタブまたは空関数"))
+
+    def test_tiny_stub_detected(self):
+        """return 0; のみの極小関数(4バイト)は検出"""
+        # "return0;" → 空白除去で8バイトだが、
+        # 実質は "return 0;" → "return0;" = 8バイト → 5以上なのでOK
+        # もっと小さい例: ";"のみ = 1バイト
+        src = """\
+int stub(void) {
+    ;
+}
+"""
+        issues = run_checks(src)
+        self.assertTrue(has_issue(issues, keyword="スタブまたは空関数"))
+
+    def test_normal_function_not_detected(self):
+        """十分な本体がある関数は検出されない"""
+        src = """\
+int normal_func(int x) {
+    int result = x * 2;
+    return result;
+}
+"""
+        issues = run_checks(src)
+        self.assertFalse(has_issue(issues, keyword="スタブまたは空関数"))
+
+
+class TestLinkage(unittest.TestCase):
+    """check_linkage: extern宣言のリンケージ確認"""
+
+    def test_extern_without_definition(self):
+        """extern宣言のみで定義なし → 検出"""
+        src = """\
+extern void remote_func(int x);
+
+void caller(void) {
+    remote_func(42);
+}
+"""
+        issues = run_checks(src)
+        self.assertTrue(has_issue(issues, keyword="リンク時に未解決シンボル"))
+
+    def test_extern_with_definition(self):
+        """extern宣言と定義が両方ある → 検出されない"""
+        src = """\
+extern void local_func(int x);
+
+void local_func(int x) {
+    int y = x + 1;
+    return;
+}
+"""
+        issues = run_checks(src)
+        self.assertFalse(has_issue(issues, keyword="リンク時に未解決シンボル"))
+
+
+class TestUndefinedCall(unittest.TestCase):
+    """check_undefined_call: 未宣言関数呼び出し検出"""
+
+    def test_undefined_call_detected(self):
+        """宣言も定義もない関数呼び出し → 検出"""
+        src = """\
+void caller(void) {
+    unknown_func(42);
+}
+"""
+        issues = run_checks(src)
+        self.assertTrue(has_issue(issues, keyword="unknown_func"))
+        self.assertTrue(has_issue(issues, keyword="ヘッダinclude漏れ"))
+
+    def test_stdlib_not_detected(self):
+        """標準ライブラリ関数は検出されない"""
+        src = """\
+#include <stdio.h>
+#include <stdlib.h>
+void caller(void) {
+    void *p = malloc(100);
+    printf("hello");
+    free(p);
+}
+"""
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.c', delete=False,
+                                          encoding='utf-8') as f:
+            f.write(src)
+            f.flush()
+            path = f.name
+        try:
+            ignore = creview.IgnoreConfig()
+            issues = creview.run_local_analysis(path, ignore,
+                                                only_rules={"undefined_call"})
+        finally:
+            os.unlink(path)
+        self.assertFalse(has_issue(issues, keyword="malloc"))
+        self.assertFalse(has_issue(issues, keyword="printf"))
+
+    def test_local_function_not_detected(self):
+        """同一ファイル内で定義された関数は検出されない"""
+        src = """\
+void helper(int x) {
+    int y = x + 1;
+    return;
+}
+
+void caller(void) {
+    helper(42);
+}
+"""
+        issues = run_checks(src)
+        self.assertFalse(has_issue(issues, keyword="helper"))
+
+    def test_extern_declared_not_detected(self):
+        """extern宣言済み関数は検出されない"""
+        src = """\
+extern void external_api(int x);
+
+void caller(void) {
+    external_api(42);
+}
+"""
+        issues = run_checks(src)
+        self.assertFalse(has_issue(issues, keyword="external_api()の宣言・定義"))
+
+
 if __name__ == "__main__":
     unittest.main()
