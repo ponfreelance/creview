@@ -20,7 +20,7 @@ from fnmatch import fnmatch
 import subprocess
 
 # ─── バージョン / 定数 ────────────────────────────────
-VERSION = "0.8.0"
+VERSION = "0.9.0"
 IGNOREFILE = ".creviewignore"
 CONFIGFILE = "config.txt"
 MAX_CHUNK_BYTES = 80_000
@@ -1201,7 +1201,8 @@ def check_packed(fp, raw, cl, issues, ignore):
 # Phase 1: ローカル静的解析エンジン
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def run_local_analysis(filepath: str, ignore: IgnoreConfig) -> List[Issue]:
+def run_local_analysis(filepath: str, ignore: IgnoreConfig,
+                       only_rules: Optional[Set[str]] = None) -> List[Issue]:
     issues: List[Issue] = []
     try:
         with open(filepath, "r", encoding="utf-8", errors="replace") as f:
@@ -1251,8 +1252,11 @@ def run_local_analysis(filepath: str, ignore: IgnoreConfig) -> List[Issue]:
         ("goto_misuse",         lambda: check_goto_misuse(filepath, raw, cl, issues)),
     ]
     for rule_name, check_fn in checks:
-        if rule_name not in off:
-            check_fn()
+        if rule_name in off:
+            continue
+        if only_rules is not None and rule_name not in only_rules:
+            continue
+        check_fn()
 
     # NOCHECK行単位抑制: 元ソースのコメントに "NOCHECK" があれば除外
     nocheck_lines: Set[int] = set()
@@ -1553,6 +1557,126 @@ def get_fix_hint(message: str) -> str:
     return ""
 
 
+# --preset用: プリセットグループ定義
+PRESETS = {
+    "memory": {
+        "description": "メモリ関連バグ検出",
+        "rules": {"null_deref", "double_free", "use_after_free", "fd_leak",
+                  "resource_leak", "memcpy_no_null", "integer_overflow",
+                  "buffer_overrun"},
+    },
+    "security": {
+        "description": "セキュリティ脆弱性検出",
+        "rules": {"unsafe_funcs", "format_string", "array_index", "toctou",
+                  "buffer_overrun", "vla", "integer_overflow", "uninitialized"},
+    },
+    "concurrency": {
+        "description": "並行処理・排他制御チェック",
+        "rules": {"mutex_unlock", "volatile", "signal_unsafe", "toctou"},
+    },
+    "style": {
+        "description": "コーディング規約・保守性チェック",
+        "rules": {"globals", "macros", "magic_numbers", "snprintf_retval",
+                  "recursive_no_limit", "goto_misuse", "switch_fallthrough",
+                  "enum_switch"},
+    },
+    "pr": {
+        "description": "PR前チェック (diff + fix-hint有効化)",
+        "options": {"diff": True, "fix_hint": True},
+        "rules": None,  # 全ルール
+    },
+    "strict": {
+        "description": "全ルール + 全指摘で終了コード1",
+        "options": {"exit_code": "maint"},
+        "rules": None,  # 全ルール
+    },
+}
+
+
+def resolve_preset(preset_name: str, args):
+    """プリセットをargsに反映。ルール制限セットを返す(Noneなら全ルール)"""
+    if preset_name not in PRESETS:
+        available = ", ".join(PRESETS.keys())
+        print(f"エラー: 不明なプリセット '{preset_name}'。利用可能: {available}",
+              file=sys.stderr)
+        sys.exit(1)
+    preset = PRESETS[preset_name]
+    # オプション上書き
+    opts = preset.get("options", {})
+    for key, val in opts.items():
+        setattr(args, key, val)
+    return preset.get("rules")
+
+
+def interpret_ask_with_api(instruction: str, config) -> dict:
+    """自然言語の指示をClaude APIで解釈し、オプションJSONを返す"""
+    preset_list = "\n".join(f"  {name}: {p['description']}" for name, p in PRESETS.items())
+    rule_list = "\n".join(f"  {name}: {desc}" for name, desc in RULE_DESCRIPTIONS.items())
+
+    system_prompt = """あなたはC言語静的解析ツール「creview」のオプション解釈AIです。
+ユーザーの自然言語の指示を解析し、適切なオプションをJSON形式で返してください。
+
+利用可能なプリセット:
+""" + preset_list + """
+
+利用可能な個別ルール:
+""" + rule_list + """
+
+利用可能なオプション:
+  severity: "critical" | "design" | "maint" (表示する重大度フィルタ)
+  fix_hint: true | false (修正ヒント表示)
+  diff: true | false (git diff変更行のみ)
+  exit_code: "critical" | "design" | "maint" (終了コード閾値)
+  rules: ["rule1", "rule2", ...] (実行するルール名リスト。省略で全ルール)
+  preset: "preset_name" (プリセット名。rulesより優先)
+
+以下の形式でJSONのみを返してください。説明文は不要です:
+{"severity": null, "fix_hint": false, "diff": false, "exit_code": "critical", "rules": null, "preset": null}
+
+nullは「指定なし(デフォルト)」を意味します。"""
+
+    user_content = f"指示: {instruction}"
+
+    try:
+        result = call_claude_api(system_prompt, user_content, config)
+        # JSON部分を抽出
+        m = re.search(r'\{[^{}]*\}', result, re.DOTALL)
+        if m:
+            return json.loads(m.group())
+        return {}
+    except (APIError, json.JSONDecodeError):
+        return {}
+
+
+def apply_ask_result(ask_result: dict, args):
+    """--ask APIの解釈結果をargsに反映。ルール制限セットを返す"""
+    if not ask_result:
+        print("指示の解釈に失敗しました。通常モードで実行します。", file=sys.stderr)
+        return None
+
+    # プリセットが指定された場合
+    preset_name = ask_result.get("preset")
+    if preset_name and preset_name in PRESETS:
+        return resolve_preset(preset_name, args)
+
+    # 個別オプション反映
+    if ask_result.get("severity"):
+        args.severity = ask_result["severity"]
+    if ask_result.get("fix_hint"):
+        args.fix_hint = True
+    if ask_result.get("diff"):
+        args.diff = True
+    if ask_result.get("exit_code"):
+        args.exit_code = ask_result["exit_code"]
+
+    # ルール制限
+    rules = ask_result.get("rules")
+    if rules and isinstance(rules, list):
+        valid_rules = set(RULE_DESCRIPTIONS.keys())
+        return set(r for r in rules if r in valid_rules) or None
+    return None
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 出力フォーマッタ
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1746,8 +1870,14 @@ def main():
                         choices=["critical", "design", "maint"],
                         default="critical",
                         help="終了コード1を返す閾値 (default: critical)")
+    parser.add_argument("--preset",
+                        help="プリセットグループ (memory/security/concurrency/style/pr/strict)")
+    parser.add_argument("--ask",
+                        help="自然言語でチェック内容を指示 (API使用)")
     parser.add_argument("--list-rules", action="store_true",
                         help="利用可能な全ルール名を表示して終了")
+    parser.add_argument("--list-presets", action="store_true",
+                        help="利用可能なプリセット一覧を表示して終了")
     parser.add_argument("--version", action="version",
                         version=f"creview {VERSION}")
     args = parser.parse_args()
@@ -1758,10 +1888,29 @@ def main():
             print(f"  {name:24s} {desc}")
         sys.exit(0)
 
+    # --list-presets: プリセット一覧表示して終了
+    if args.list_presets:
+        for name, preset in PRESETS.items():
+            rules_info = "全ルール" if preset.get("rules") is None else f"{len(preset['rules'])}ルール"
+            print(f"  {name:16s} {preset['description']} ({rules_info})")
+        sys.exit(0)
+
     if not args.targets:
         parser.error("対象ファイルまたはディレクトリを指定してください")
 
     config = load_config()
+
+    # ── --preset / --ask 解決 ──
+    only_rules = None  # None = 全ルール実行
+    if args.preset:
+        only_rules = resolve_preset(args.preset, args)
+    elif args.ask:
+        if not config.api_key:
+            print("エラー: --ask にはAPI_KEYが必要", file=sys.stderr)
+            sys.exit(1)
+        print(f"指示を解釈中: 「{args.ask}」...", file=sys.stderr)
+        ask_result = interpret_ask_with_api(args.ask, config)
+        only_rules = apply_ask_result(ask_result, args)
 
     # ── 仕様レビューモード ──
     if args.spec:
@@ -1822,7 +1971,7 @@ def main():
             continue
 
         # Phase 1: ローカル静的解析
-        local_issues = run_local_analysis(fpath, ignore)
+        local_issues = run_local_analysis(fpath, ignore, only_rules=only_rules)
 
         # --diff: 変更行のみにフィルタ
         if args.diff:

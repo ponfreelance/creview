@@ -1,5 +1,5 @@
 ============================================
-C設計レビューAI  CReview v0.8.0
+C設計レビューAI  CReview v0.9.0
 ============================================
 
 
@@ -241,6 +241,33 @@ CIで新規バグのみ検出したい場合に有効。
 利用可能な全ルール名と説明を表示。
 
 
+■ プリセットグループ
+--------------------------------------------
+
+  creview --preset memory src/       メモリ関連バグのみ
+  creview --preset security src/     セキュリティ脆弱性のみ
+  creview --preset concurrency src/  並行処理チェックのみ
+  creview --preset style src/        コーディング規約チェック
+  creview --preset pr src/           PR前チェック (diff+fix-hint)
+  creview --preset strict src/       全ルール+全指摘で終了コード1
+
+プリセット一覧の表示：
+  creview --list-presets
+
+API不要。オプションを覚えなくても目的別にチェック可能。
+
+
+■ 自然言語指示 (--ask)
+--------------------------------------------
+
+  creview --ask "メモリリークを重点的にチェックして" src/
+  creview --ask "重大な問題だけヒント付きで見せて" main.c
+  creview --ask "PR前の最終チェックをして" src/
+
+Claude APIが指示を解釈し、適切なルール・オプションを
+自動選択して実行。API_KEY必須。
+
+
 ■ 注意事項
 --------------------------------------------
 
@@ -257,9 +284,11 @@ CIで新規バグのみ検出したい場合に有効。
 
 1. 実装前    creview --spec spec.txt
 2. 実装後    creview --fix-hint src/
-3. PR前      creview --diff --local-only src/
-4. CI        creview --format sarif --local-only src/ > results.sarif
-5. CI差分    creview --baseline prev.json --local-only src/
+3. メモリ    creview --preset memory src/
+4. PR前      creview --preset pr src/
+5. CI        creview --format sarif --local-only src/ > results.sarif
+6. CI差分    creview --baseline prev.json --local-only src/
+7. 自由指示  creview --ask "セキュリティを重点的に" src/
 
 
 ■ 終了コード

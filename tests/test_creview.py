@@ -522,5 +522,134 @@ class TestBaseline(unittest.TestCase):
         self.assertEqual(filtered[0].message, "新しい指摘")
 
 
+class TestPreset(unittest.TestCase):
+    def test_memory_preset_rules(self):
+        """memoryプリセットはメモリ関連ルールのみ含む"""
+        preset = creview.PRESETS["memory"]
+        self.assertIn("null_deref", preset["rules"])
+        self.assertIn("double_free", preset["rules"])
+        self.assertIn("use_after_free", preset["rules"])
+        self.assertNotIn("magic_numbers", preset["rules"])
+
+    def test_memory_preset_filters(self):
+        """memoryプリセット使用時、メモリ関連以外の指摘が出ない"""
+        src = '''
+        int g = 0;
+        void f() {
+            g = 42;
+            char *p = malloc(100);
+        }
+        '''
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.c', delete=False,
+                                          encoding='utf-8') as f:
+            f.write(src)
+            f.flush()
+            path = f.name
+        try:
+            ignore = creview.IgnoreConfig()
+            only_rules = creview.PRESETS["memory"]["rules"]
+            issues = creview.run_local_analysis(path, ignore, only_rules=only_rules)
+            # NULLチェック漏れは出るはず
+            self.assertTrue(has_issue(issues, keyword="NULLチェック"))
+            # グローバル変数やマジックナンバーは出ないはず
+            self.assertFalse(has_issue(issues, keyword="グローバル変数"))
+        finally:
+            os.unlink(path)
+
+    def test_security_preset_exists(self):
+        self.assertIn("security", creview.PRESETS)
+        self.assertIn("unsafe_funcs", creview.PRESETS["security"]["rules"])
+
+    def test_pr_preset_all_rules(self):
+        """prプリセットは全ルール実行"""
+        self.assertIsNone(creview.PRESETS["pr"].get("rules"))
+        self.assertTrue(creview.PRESETS["pr"]["options"]["diff"])
+        self.assertTrue(creview.PRESETS["pr"]["options"]["fix_hint"])
+
+    def test_resolve_preset_unknown(self):
+        """不明なプリセットはsys.exit"""
+        import argparse
+        args = argparse.Namespace()
+        with self.assertRaises(SystemExit):
+            creview.resolve_preset("nonexistent", args)
+
+    def test_list_presets(self):
+        """全プリセットにdescriptionがある"""
+        for name, preset in creview.PRESETS.items():
+            self.assertIn("description", preset)
+
+
+class TestOnlyRules(unittest.TestCase):
+    def test_only_rules_filters(self):
+        """only_rules指定で特定ルールのみ実行"""
+        src = '''
+        void f() {
+            char *p = malloc(100);
+            printf(p);
+        }
+        '''
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.c', delete=False,
+                                          encoding='utf-8') as f:
+            f.write(src)
+            f.flush()
+            path = f.name
+        try:
+            ignore = creview.IgnoreConfig()
+            # format_stringのみ実行
+            issues = creview.run_local_analysis(path, ignore,
+                                                 only_rules={"format_string"})
+            self.assertTrue(has_issue(issues, keyword="書式文字列"))
+            # null_derefは出ない
+            self.assertFalse(has_issue(issues, keyword="NULLチェック"))
+        finally:
+            os.unlink(path)
+
+
+class TestAskResult(unittest.TestCase):
+    def test_apply_ask_result_empty(self):
+        """空の結果は通常モードにフォールバック"""
+        import argparse
+        args = argparse.Namespace(severity=None, fix_hint=False,
+                                   diff=False, exit_code="critical")
+        result = creview.apply_ask_result({}, args)
+        self.assertIsNone(result)
+
+    def test_apply_ask_result_with_rules(self):
+        """ルール指定ありの結果を正しく反映"""
+        import argparse
+        args = argparse.Namespace(severity=None, fix_hint=False,
+                                   diff=False, exit_code="critical")
+        ask_result = {
+            "severity": "critical",
+            "fix_hint": True,
+            "rules": ["null_deref", "double_free"],
+        }
+        only_rules = creview.apply_ask_result(ask_result, args)
+        self.assertEqual(only_rules, {"null_deref", "double_free"})
+        self.assertTrue(args.fix_hint)
+        self.assertEqual(args.severity, "critical")
+
+    def test_apply_ask_result_with_preset(self):
+        """プリセット指定のask結果"""
+        import argparse
+        args = argparse.Namespace(severity=None, fix_hint=False,
+                                   diff=False, exit_code="critical")
+        ask_result = {"preset": "memory"}
+        only_rules = creview.apply_ask_result(ask_result, args)
+        self.assertEqual(only_rules, creview.PRESETS["memory"]["rules"])
+
+    def test_apply_ask_result_invalid_rules_ignored(self):
+        """不正なルール名は除外される"""
+        import argparse
+        args = argparse.Namespace(severity=None, fix_hint=False,
+                                   diff=False, exit_code="critical")
+        ask_result = {"rules": ["null_deref", "invalid_rule_xyz"]}
+        only_rules = creview.apply_ask_result(ask_result, args)
+        self.assertIn("null_deref", only_rules)
+        self.assertNotIn("invalid_rule_xyz", only_rules)
+
+
 if __name__ == "__main__":
     unittest.main()
