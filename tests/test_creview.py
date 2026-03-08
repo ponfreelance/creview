@@ -1254,6 +1254,7 @@ int bigger(int x) {
     if (y > 100) y = 100;
     return y;
 }
+void sentinel(void) {}
 """
         import tempfile
         import shutil
