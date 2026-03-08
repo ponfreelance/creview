@@ -1,5 +1,5 @@
 ============================================
-C設計レビューAI  CReview v0.4.0
+C設計レビューAI  CReview v0.13.0
 ============================================
 
 
@@ -46,13 +46,46 @@ C設計レビューAI  CReview v0.4.0
   creview --local-only main.c
 
 APIキー無しでも使えます。
-ローカル静的解析14パターンのみ実行。
+ローカル静的解析33パターンのみ実行。
 
 
-■ JSON出力
+■ 差分モード（変更行のみレビュー）
 --------------------------------------------
 
-  creview --format json main.c
+  creview --diff --local-only src/
+
+git diffの変更行に該当する指摘のみ出力。
+PR前の差分チェックに最適。
+
+
+■ 重大度フィルタ
+--------------------------------------------
+
+  creview --local-only --severity critical src/
+
+critical / design / maint から選択。
+指定した重大度の指摘のみ表示。
+
+
+■ 集計モード
+--------------------------------------------
+
+  creview --local-only --count src/
+
+ファイルごとの重大度別件数と合計を表示。
+出力例:
+  main.c: 重大=3 設計不明=1 保守危険=2
+  util.c: 重大=0 設計不明=2 保守危険=1
+  合計: 重大=3 設計不明=3 保守危険=3
+
+
+■ 出力形式
+--------------------------------------------
+
+  creview --format text main.c      テキスト（デフォルト）
+  creview --format json main.c      JSON
+  creview --format markdown main.c  Markdown（レポート向け）
+  creview --format sarif main.c     SARIF 2.1.0（GitHub Code Scanning連携）
 
 
 ■ 出力の見方
@@ -68,6 +101,49 @@ APIキー無しでも使えます。
   将来バグ化可能。
 
 
+■ ローカル静的解析パターン一覧（33種）
+--------------------------------------------
+
+  [重大]
+  1.  malloc/calloc/realloc NULLチェック漏れ
+  2.  gets/sprintf/strcpy/strcat 使用
+  3.  memcpy/memmove/memset NULLポインタ未検証
+  4.  外部入力の配列添字バウンドチェック漏れ
+  5.  二重free
+  6.  sizeof(ポインタ)
+  7.  fopen/fclose リーク
+  8.  フォーマット文字列脆弱性 (printf変数直接)
+  9.  use-after-free (free後参照)
+  10. 未初期化変数使用
+  11. 整数オーバーフロー (malloc乗算)
+  12. open/socket/pipe リソースリーク
+  13. 固定バッファオーバーラン (strncpy/memcpyサイズ超過)
+  14. pthread_mutex_lock/unlock不整合 (デッドロック)
+  15. TOCTOU競合 (access→open等)
+  16. シグナルハンドラ内async-signal-unsafe関数
+
+  [設計不明]
+  17. return値と空returnの混在
+  18. switch case fall-through
+  19. マクロ引数の括弧未保護
+  20. volatile変数の非アトミック操作
+  21. packed構造体のアラインメント問題
+  22. signed/unsigned混合比較
+  23. NULLチェック分岐後のポインタ使用
+  24. 無限ループ (break/returnなし)
+  25. enum型switchでdefaultなし
+  26. 暗黙切り詰めキャスト
+  27. ビットフィールド符号未指定
+  28. 可変長配列(VLA)使用
+
+  [保守危険]
+  29. グローバル変数の関数内直接更新
+  30. マジックナンバー
+  31. snprintf戻り値無視
+  32. 深さ制限なし自己再帰
+  33. goto前方ジャンプ
+
+
 ■ 警告抑制 .creviewignore
 --------------------------------------------
 
@@ -76,10 +152,245 @@ APIキー無しでも使えます。
   GLOBAL_OK      グローバル変数警告を抑制
   MACRO_ALLOW    マクロ警告を抑制
   MAGIC_OK       マジックナンバー警告を抑制
-  VOLATILE_OK    volatile変数の非アトミック操作警告を抑制
+  VOLATILE_OK    volatile非アトミック操作警告を抑制
   PACKED_OK      packed構造体警告を抑制
 
   # 以降はコメント
+
+
+■ ファイル除外 (EXCLUDE)
+--------------------------------------------
+
+.creviewignore に EXCLUDE パターンを記述：
+
+  EXCLUDE generated_*.c
+  EXCLUDE test_*.c
+  EXCLUDE vendor/*
+
+ファイル名またはパスのglob一致で除外。
+
+
+■ 個別ルール無効化 (RULE_OFF)
+--------------------------------------------
+
+.creviewignore にルール名を記述して無効化：
+
+  RULE_OFF format_string
+  RULE_OFF magic_numbers
+  RULE_OFF snprintf_retval
+
+利用可能なルール名：
+  null_deref, unsafe_funcs, memcpy_no_null,
+  array_index, double_free, return_inconsistency,
+  globals, macros, switch_fallthrough, sizeof_pointer,
+  fd_leak, magic_numbers, volatile, packed,
+  format_string, use_after_free, uninitialized,
+  sign_compare, integer_overflow, resource_leak,
+  snprintf_retval, buffer_overrun, null_deref_branch,
+  infinite_loop, enum_switch, recursive_no_limit,
+  mutex_unlock, toctou, signal_unsafe,
+  cast_truncation, bitfield_sign, vla, goto_misuse
+
+全ルール名の一覧表示：
+  creview --list-rules
+
+
+■ 行単位の抑制 (NOCHECK)
+--------------------------------------------
+
+ソースコード中のコメントに NOCHECK を書くと
+その行の指摘を全て抑制：
+
+  char *p = malloc(100);  // NOCHECK
+
+
+■ 修正ヒント
+--------------------------------------------
+
+  creview --fix-hint --local-only main.c
+
+各指摘に修正方法のヒントを1行で付与して表示。
+
+
+■ 修正案表示 (--fix)
+--------------------------------------------
+
+  creview --fix --local-only main.c
+  creview --fix --format markdown --local-only src/
+
+各指摘に2パターンの修正コードを表示：
+
+  [最小修正] そのまま動かすための最低限の修正
+  [推奨修正] 本来こうすべきという修正
+
+出力例:
+  [重大]
+  main.c:15
+  pにNULLチェックなし。malloc失敗時クラッシュ
+    [最小修正]
+      char *p = malloc(100);
+      if (p == NULL) return;
+    [推奨修正]
+      char *p = malloc(100);
+      if (p == NULL) {
+          fprintf(stderr, "メモリ確保失敗: p\n");
+          return -1;
+      }
+
+--fix-hint (1行ヒント) と --fix (コード例) は併用可能。
+
+
+■ 類似パターン水平展開 (--similar)
+--------------------------------------------
+
+  creview --similar --local-only src/
+  creview --similar --fix --local-only src/
+
+各指摘に対して、同じパターンが他のファイル・行にないか全対象
+ファイルを横断検索し、「類似箇所」として表示。
+
+出力例:
+  [重大]
+  main.c:15
+  pにNULLチェックなし。malloc失敗時クラッシュ
+    [類似箇所] 2件
+      utils.c:42  char *buf = malloc(BUF_SIZE);
+      parser.c:88  node = calloc(1, sizeof(*node));
+
+1つのバグを見つけたら同じパターンを全コードから洗い出せるため、
+修正漏れを防止できる。--fix と併用すると修正案+類似箇所を一度に
+確認可能。
+
+
+■ スタックサイズ解析 (--stack)
+--------------------------------------------
+
+  creview --stack --local-only src/
+  creview --stack --stack-threshold 4096 --local-only main.c
+
+関数ごとのローカル変数・配列からスタック使用量を推定し、レポート
+を表示。閾値超過(デフォルト8KB)は重大指摘として検出。
+
+出力例:
+  ── スタック解析: main.c ──
+  関数名                            推定バイト  備考
+  ─────────────────────────────────────────────
+  big_func                         105,536  !!超過
+    └─ char buffer[65536]  (65,536バイト)
+    └─ int matrix[100][100]  (40,000バイト)
+  small_func                             4  -
+  risky                                  0  alloca, 再帰
+    └─ alloca()  (サイズ不定)
+  ─────────────────────────────────────────────
+  関数数: 3  合計推定: 105,540バイト
+
+検出項目:
+  - 閾値超過の関数 (デフォルト8192バイト, --stack-thresholdで変更可)
+  - alloca()使用 (実行時スタック量不定)
+  - 再帰関数 + 大きなスタック使用の組み合わせ
+  - VLA (可変長配列) のサイズ不定
+
+対応する型サイズ (LP64 ABI):
+  char=1, short=2, int=4, long=8, float=4, double=8, ポインタ=8
+  size_t=8, int8_t〜int64_t, pid_t=4, off_t=8, time_t=8 等
+
+--stack-threshold オプション:
+  デフォルトは8192バイト。組み込み環境等では小さく設定可能:
+    creview --stack --stack-threshold 1024 --local-only src/
+
+
+■ バッファ使用率解析 (--buf-usage)
+--------------------------------------------
+
+  creview --buf-usage --local-only src/
+
+バッファ(配列)の宣言サイズに対し、各書き込み操作が最大何バイト
+使用するかを解析し、使用率として表示。
+
+出力例:
+  ── バッファ使用率: main.c ──
+  バッファ           宣言      最大書込   使用率  操作
+  ──────────────────────────────────────────────────
+  big_buf        4,096B      256B       6%  snprintf
+    L12: snprintf  最大256B
+  small_buf         64B       64B     100%  fgets, strncpy
+    L15: strncpy  最大63B
+    L21: fgets  最大64B
+  tiny              16B       不定  !!危険  strcpy
+    L24: strcpy  不定(危険)
+  ──────────────────────────────────────────────────
+  バッファ数: 3  安全: 1  超過: 0  不定: 1
+
+追跡する書き込み操作:
+  安全系 (サイズ制限あり):
+    snprintf, strncpy, memcpy, memmove, memset,
+    read, recv, fgets, fread
+  危険系 (サイズ制限なし):
+    sprintf, strcpy, strcat, gets
+  リテラルコピー:
+    strcpy(buf, "hello") → 6バイトと判定
+
+サイズ式の解決:
+  sizeof(buf), sizeof(buf) - 1, 数値リテラル, A * B
+
+--stackと併用で、スタック使用量+バッファ使用率を同時確認可能:
+  creview --stack --buf-usage --local-only src/
+
+
+■ ベースライン差分
+--------------------------------------------
+
+  creview --format json --local-only src/ > baseline.json
+  creview --baseline baseline.json --local-only src/
+
+前回結果をベースラインとし、新規指摘のみ表示。
+CIで新規バグのみ検出したい場合に有効。
+
+
+■ 終了コード閾値
+--------------------------------------------
+
+  creview --exit-code design --local-only src/
+
+終了コード1を返す重大度の閾値を変更。
+  critical (デフォルト): 重大指摘があれば1
+  design:               設計不明以上で1
+  maint:                保守危険以上で1
+
+
+■ ルール一覧表示
+--------------------------------------------
+
+  creview --list-rules
+
+利用可能な全ルール名と説明を表示。
+
+
+■ プリセットグループ
+--------------------------------------------
+
+  creview --preset memory src/       メモリ関連バグのみ
+  creview --preset security src/     セキュリティ脆弱性のみ
+  creview --preset concurrency src/  並行処理チェックのみ
+  creview --preset style src/        コーディング規約チェック
+  creview --preset pr src/           PR前チェック (diff+fix-hint)
+  creview --preset strict src/       全ルール+全指摘で終了コード1
+
+プリセット一覧の表示：
+  creview --list-presets
+
+API不要。オプションを覚えなくても目的別にチェック可能。
+
+
+■ 自然言語指示 (--ask)
+--------------------------------------------
+
+  creview --ask "メモリリークを重点的にチェックして" src/
+  creview --ask "重大な問題だけヒント付きで見せて" main.c
+  creview --ask "PR前の最終チェックをして" src/
+
+Claude APIが指示を解釈し、適切なルール・オプションを
+自動選択して実行。API_KEY必須。
 
 
 ■ 注意事項
@@ -97,15 +408,21 @@ APIキー無しでも使えます。
 --------------------------------------------
 
 1. 実装前    creview --spec spec.txt
-2. 実装後    creview src/
-3. PR前      creview --local-only src/
+2. 実装後    creview --fix-hint src/
+3. メモリ    creview --preset memory src/
+4. PR前      creview --preset pr src/
+5. CI        creview --format sarif --local-only src/ > results.sarif
+6. CI差分    creview --baseline prev.json --local-only src/
+7. 自由指示  creview --ask "セキュリティを重点的に" src/
 
 
 ■ 終了コード
 --------------------------------------------
 
-  0  重大指摘なし
-  1  重大指摘あり
+  0  閾値未満の指摘のみ（または指摘なし）
+  1  閾値以上の指摘あり
+
+※ 閾値は --exit-code で変更可能（デフォルト: critical）
 
 
 ■ ファイル構成

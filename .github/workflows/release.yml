@@ -29,8 +29,11 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install PyInstaller
-        run: pip install pyinstaller
+      - name: Install dependencies
+        run: pip install pyinstaller anthropic
+
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
 
       - name: Build binary
         run: pyinstaller --onefile --name creview creview.py
@@ -79,6 +82,8 @@ jobs:
       contents: write
 
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           merge-multiple: true
@@ -86,6 +91,7 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
+          body_path: RELEASE_NOTES.md
           files: |
             creview_win.zip
             creview_mac.tar.gz
