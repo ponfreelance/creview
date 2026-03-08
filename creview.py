@@ -1242,6 +1242,9 @@ def _get_obj_func_sizes(filepath: str) -> Optional[Dict[str, int]]:
                 # macOS: シンボル名の先頭 _ を除去
                 if fname.startswith('_'):
                     fname = fname[1:]
+                # コンパイラ内部ラベル(ltmp等)を除外
+                if fname.startswith('ltmp'):
+                    continue
                 try:
                     addr = int(parts[0], 16)
                     size = int(parts[1], 16)
