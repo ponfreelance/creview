@@ -146,6 +146,27 @@ chmod +x build.sh
 
 GitHub Actionsによる3OS同時ビルドにも対応（`.github/workflows/release.yml`）。
 
+## このツールでやらないこと
+
+creview は「個人・小規模で本気で使う」CLI です。以下は **対象外** です:
+
+- ❌ プロジェクト横断の依存解析（関数間データフロー / 影響範囲分析）→ [C-Safety-audit-framework](https://github.com/ponfreelance/C-Safety-audit-framework)
+- ❌ MISRA ルールの構造的検出（リスク自動分類 A/B/C）→ CSAF
+- ❌ HTML 監査レポート・監査履歴の差分比較 → CSAF
+- ❌ 150KLOC 級の大規模リポの継続監査運用 → CSAF + カスタム対応
+
+社内規約のルール追加・既存 CI/CD 組み込みは下記「カスタム対応」で承ります。
+
+## 関連プロダクト
+
+C言語レビュー / 監査の OSS 3 製品。用途で使い分けてください。
+
+| プロダクト | 役割 | 形態 |
+|---|---|---|
+| [c-review-ai](https://github.com/ponfreelance/c-review-ai) | まず Web で触ってみる体験版 | Web (Docker) |
+| **creview**（このリポ） | 手元で本気で使う C 言語レビュー（36パターン + Claude API） | CLI (Win/Mac/Linux バイナリ) |
+| [C-Safety-audit-framework](https://github.com/ponfreelance/C-Safety-audit-framework) | プロジェクト横断の安全性監査（MISRA・依存グラフ） | Python パッケージ |
+
 ## カスタム対応
 
 社内コーディング規約に合わせたレビュールールの追加・調整を承ります。
