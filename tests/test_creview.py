@@ -504,7 +504,7 @@ class TestListRules(unittest.TestCase):
         self.assertIn("vla", creview.RULE_DESCRIPTIONS)
         self.assertIn("goto_misuse", creview.RULE_DESCRIPTIONS)
         self.assertIn("stack_usage", creview.RULE_DESCRIPTIONS)
-        self.assertEqual(len(creview.RULE_DESCRIPTIONS), 34)
+        self.assertEqual(len(creview.RULE_DESCRIPTIONS), 37)  # 0.17.0: +attr_nonnull/attr_wur/null_callsite
 
 
 class TestBaseline(unittest.TestCase):
@@ -1383,6 +1383,204 @@ void caller(void) {
 """
         issues = run_checks(src)
         self.assertFalse(has_issue(issues, keyword="external_api()の宣言・定義"))
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 0.17.0 (Zenn コメントロールアウト) 追加テスト
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+FIXTURES_DIR = os.path.join(os.path.dirname(__file__), "fixtures")
+
+
+def run_checks_on_file(path: str, only_rules=None) -> list:
+    ignore = creview.IgnoreConfig()
+    return creview.run_local_analysis(path, ignore, only_rules=only_rules)
+
+
+class TestSizeofFP(unittest.TestCase):
+    """B1: sizeof FP fixture (7 ケース)。CASE 1/2/6/7 は flag されない、CASE 3/4/5 は flag。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.path = os.path.join(FIXTURES_DIR, "sizeof_cases.c")
+        cls.issues = run_checks_on_file(cls.path, only_rules={"sizeof_pointer"})
+
+    def _flagged_cases(self):
+        """sizeof message を含む issue が、各 case 関数の body 行範囲のどこに出たかを集める。"""
+        flagged: Set[int] = set()
+        with open(self.path, "r", encoding="utf-8") as f:
+            lines = f.read().split("\n")
+        # case 関数定義行 (line index) を抽出
+        case_starts = {}  # case_n -> line_no (1-indexed)
+        for i, line in enumerate(lines):
+            for n in range(1, 8):
+                if f"void case{n}(" in line:
+                    case_starts[n] = i + 1
+        # case_n の body は case_n の開始行から次 case の開始行直前まで
+        ordered = sorted(case_starts.items(), key=lambda x: x[1])
+        ranges = {}
+        for idx, (n, start) in enumerate(ordered):
+            end = ordered[idx + 1][1] - 1 if idx + 1 < len(ordered) else len(lines)
+            ranges[n] = (start, end)
+        for iss in self.issues:
+            if "sizeof" not in iss.message:
+                continue
+            for n, (s, e) in ranges.items():
+                if s <= iss.line <= e:
+                    flagged.add(n)
+        return flagged
+
+    def test_case1_local_array_not_flagged(self):
+        self.assertNotIn(1, self._flagged_cases(), "CASE 1 (local array) should NOT be flagged")
+
+    def test_case2_filescope_array_not_flagged(self):
+        self.assertNotIn(2, self._flagged_cases(), "CASE 2 (file-scope array) should NOT be flagged")
+
+    def test_case3_param_array_flagged(self):
+        self.assertIn(3, self._flagged_cases(), "CASE 3 (param array form decay) MUST be flagged")
+
+    def test_case4_param_pointer_flagged(self):
+        self.assertIn(4, self._flagged_cases(), "CASE 4 (param pointer) MUST be flagged")
+
+    def test_case5_local_pointer_flagged(self):
+        self.assertIn(5, self._flagged_cases(), "CASE 5 (local pointer in length context) MUST be flagged")
+
+    def test_case6_struct_member_not_flagged(self):
+        self.assertNotIn(6, self._flagged_cases(), "CASE 6 (struct member array) should NOT be flagged")
+
+    def test_case7_typedef_array_not_flagged(self):
+        self.assertNotIn(7, self._flagged_cases(), "CASE 7 (typedef array local) should NOT be flagged")
+
+
+class TestAttributeContracts(unittest.TestCase):
+    """B2: ATTR-NONNULL-001 / ATTR-WUR-001 / NULL-CALLSITE-001。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.path = os.path.join(FIXTURES_DIR, "attribute_contracts.c")
+        cls.issues = run_checks_on_file(cls.path)
+
+    def test_nonnull_violation_flagged(self):
+        self.assertTrue(has_issue(self.issues, creview.Severity.CRITICAL, "ATTR-NONNULL-001"))
+
+    def test_wur_violation_flagged(self):
+        self.assertTrue(has_issue(self.issues, creview.Severity.DESIGN, "ATTR-WUR-001"))
+
+    def test_null_callsite_flagged(self):
+        self.assertTrue(has_issue(self.issues, creview.Severity.CRITICAL, "NULL-CALLSITE-001"))
+
+    def test_safe_function_not_flagged(self):
+        # process_data_safe は nonnull 付き、ATTR-NONNULL-001 は出てはいけない
+        nonnull_issues = [i for i in self.issues
+                          if "ATTR-NONNULL-001" in i.message and "process_data_safe" in i.message]
+        self.assertEqual(len(nonnull_issues), 0)
+
+    def test_check_id_not_wur_flagged(self):
+        # check_id は warn_unused_result 付き、ATTR-WUR-001 は出てはいけない
+        wur_issues = [i for i in self.issues
+                      if "ATTR-WUR-001" in i.message and "check_id" in i.message]
+        self.assertEqual(len(wur_issues), 0)
+
+
+class TestMagicNumberUnified(unittest.TestCase):
+    """B3: 統一マジックナンバー検出 (allowlist 外を全 flag、context で severity)。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.path = os.path.join(FIXTURES_DIR, "magic_number_cases.c")
+        cls.issues = run_checks_on_file(cls.path, only_rules={"magic_numbers"})
+
+    def _has(self, severity, value_str, context_label):
+        for i in self.issues:
+            if i.severity == severity and value_str in i.message and context_label in i.message:
+                return True
+        return False
+
+    def test_case_a_array_decl_critical(self):
+        self.assertTrue(self._has(creview.Severity.CRITICAL, "100", "バッファサイズ"),
+                        f"100 (array decl) should be 重大 / バッファサイズ; got: {[i.message for i in self.issues]}")
+
+    def test_case_b_malloc_critical(self):
+        self.assertTrue(self._has(creview.Severity.CRITICAL, "256", "バッファサイズ"))
+
+    def test_case_c_loop_bound_maint(self):
+        self.assertTrue(self._has(creview.Severity.MAINT, "32", "ループ上限"))
+
+    def test_case_d_bitmask_maint(self):
+        self.assertTrue(self._has(creview.Severity.MAINT, "0xFF", "ビットマスク"))
+
+    def test_case_e_general_maint(self):
+        self.assertTrue(self._has(creview.Severity.MAINT, "10", "リテラル"))
+
+    def test_case_f_sizeof_not_flagged(self):
+        # sizeof(int) の int は型名なので integer literal ではないが、
+        # `sizeof(4)` 相当の数値パターンが出ても skip されることを確認
+        # ここでは sizeof(int) なので元々マッチしないが、negative test として残す
+        sizeof_issues = [i for i in self.issues if i.line == 41 or i.line == 42]
+        # CASE F の int n = sizeof(int); 行に何も flag されないこと
+        for i in self.issues:
+            self.assertNotIn("sizeof", i.message, "sizeof 内の数値は除外されるべき")
+
+    def test_default_allowlist_excludes_zero_one(self):
+        # `if (data == 0)` のような 0 は flag されない
+        for i in self.issues:
+            self.assertNotIn("マジックナンバー0 ", i.message)
+            self.assertNotIn("マジックナンバー1 ", i.message)
+
+
+class TestStaticInitNoCwe457(unittest.TestCase):
+    """B5: static / file-scope の自動 0 初期化変数を CWE-457 系 message に紐づけない回帰テスト。"""
+
+    def test_static_global_not_flagged_uninitialized(self):
+        path = os.path.join(FIXTURES_DIR, "static_init_no_cwe457.c")
+        issues = run_checks_on_file(path)
+        for i in issues:
+            self.assertNotIn("未初期化変数g_initialized", i.message)
+            self.assertNotIn("未初期化変数g_ptr", i.message)
+
+
+class TestMagicAllowlistConfig(unittest.TestCase):
+    """B3: .creviewrc.json で allowlist を拡張すると flag されなくなる。"""
+
+    def test_cli_magic_allowlist_excludes(self):
+        # `--magic-allowlist 100` 相当を IgnoreConfig 経由で渡す
+        import tempfile
+        src = "void f(void) { char buf[100]; (void)buf; }\n"
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.c', delete=False,
+                                          encoding='utf-8') as f:
+            f.write(src)
+            f.flush()
+            path = f.name
+        try:
+            ignore = creview.IgnoreConfig()
+            ignore.magic_allowlist = {-1, 0, 1, 2, 100}  # 100 を追加
+            issues = creview.run_local_analysis(path, ignore, only_rules={"magic_numbers"})
+            for i in issues:
+                self.assertNotIn("100", i.message)
+        finally:
+            os.unlink(path)
+
+
+class TestCheckPrerequisites(unittest.TestCase):
+    """B4: scan_build_flags のスモーク。"""
+
+    def test_scan_no_build_files(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            files, miss_req, _ = creview.scan_build_flags(d)
+            self.assertEqual(files, [])
+            self.assertEqual(set(miss_req), set(creview._REQUIRED_FLAGS))
+
+    def test_scan_with_makefile(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            mk = os.path.join(d, "Makefile")
+            with open(mk, "w", encoding="utf-8") as f:
+                f.write("CFLAGS += -Wall -Wextra -Werror -fanalyzer\n")
+            files, miss_req, miss_rec = creview.scan_build_flags(d)
+            self.assertIn(mk, files)
+            self.assertEqual(miss_req, [])
+            self.assertNotIn("-fanalyzer", miss_rec)
 
 
 if __name__ == "__main__":

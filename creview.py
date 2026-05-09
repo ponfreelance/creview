@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-creview v0.14.0 - C言語設計レビュー専用CLI
+creview v0.17.0 - C言語設計レビュー専用CLI
 指摘専用。コード生成・修正案・改善案 一切なし。
 ローカル静的解析 + Claude API深層レビュー 二段構成。
 """
@@ -20,7 +20,7 @@ from fnmatch import fnmatch
 import subprocess
 
 # ─── バージョン / 定数 ────────────────────────────────
-VERSION = "0.14.1"
+VERSION = "0.17.0"
 IGNOREFILE = ".creviewignore"
 CONFIGFILE = "config.txt"
 MAX_CHUNK_BYTES = 80_000
@@ -124,12 +124,61 @@ class IgnoreConfig:
     magic_ok: bool = False
     exclude_patterns: List[str] = None
     rule_off: Set[str] = None
+    # マジックナンバー検出 allowlist。None なら DEFAULT_MAGIC_ALLOWLIST を使う。
+    magic_allowlist: Optional[Set[int]] = None
 
     def __post_init__(self):
         if self.exclude_patterns is None:
             self.exclude_patterns = []
         if self.rule_off is None:
             self.rule_off = set()
+
+
+# B3 マジックナンバー統一ルール: allowlist {-1, 0, 1, 2} 以外の整数リテラルを全 flag。
+DEFAULT_MAGIC_ALLOWLIST: Set[int] = {-1, 0, 1, 2}
+CREVIEWRC = ".creviewrc.json"
+
+
+def _parse_int_literal(s: str) -> Optional[int]:
+    """C 整数リテラル文字列 (decimal / 0x.. / 0b.. / 0..) を int に変換。失敗時 None。"""
+    s = s.strip().rstrip("uUlL")
+    if not s:
+        return None
+    try:
+        if s.lower().startswith("0x"):
+            return int(s, 16)
+        if s.lower().startswith("0b"):
+            return int(s, 2)
+        if s.startswith("0") and len(s) > 1 and s[1].isdigit():
+            return int(s, 8)
+        return int(s)
+    except ValueError:
+        return None
+
+
+def load_creviewrc_json(start_dir: str) -> Optional[Set[int]]:
+    """.creviewrc.json から magic_number.allowlist を読む。無ければ None。"""
+    path = os.path.join(start_dir, CREVIEWRC)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    mag = data.get("magic_number") or {}
+    raw_list = mag.get("allowlist")
+    if not isinstance(raw_list, list):
+        return None
+    out: Set[int] = set()
+    for item in raw_list:
+        if isinstance(item, int):
+            out.add(item)
+        elif isinstance(item, str):
+            v = _parse_int_literal(item)
+            if v is not None:
+                out.add(v)
+    return out if out else None
 
 
 @dataclass
@@ -276,11 +325,18 @@ def is_excluded(filepath: str, ignore: IgnoreConfig) -> bool:
 
 
 def find_ignore(file_path: str) -> IgnoreConfig:
-    """ファイルのディレクトリ → カレントディレクトリの順で.creviewignoreを探す"""
+    """ファイルのディレクトリ → カレントディレクトリの順で.creviewignoreを探す。
+    .creviewrc.json (magic_number.allowlist) も同経路で探して反映する。"""
     file_dir = os.path.dirname(os.path.abspath(file_path))
     ig = load_ignore(file_dir)
     if not _ignore_has_any(ig):
         ig = load_ignore(os.getcwd())
+    # .creviewrc.json から magic allowlist を上書き (file_dir 優先、なければ CWD)
+    allowlist = load_creviewrc_json(file_dir)
+    if allowlist is None:
+        allowlist = load_creviewrc_json(os.getcwd())
+    if allowlist is not None:
+        ig.magic_allowlist = allowlist
     return ig
 
 
@@ -546,20 +602,129 @@ def check_switch_fallthrough(fp, raw, cl, issues):
                 has_break = True
 
 
+def _find_function_blocks(cl):
+    """関数定義の (start_line_1based, end_line_1based, params_str) を返す。
+
+    関数定義は `<head>(<params>) ... {` で始まり、対応する `}` で終わる top-level ブロック。
+    """
+    text = "\n".join(cl)
+    # `{` で終わる関数定義のみ。`(` のあとに `[^{;]*?` を許して attribute や K&R 宣言を許容。
+    func_def_re = re.compile(
+        r'^(?P<head>[^();{\n]{0,200}?)\b\w+\s*\((?P<params>[^)]*)\)(?P<post>[^{;]*?)\{',
+        re.MULTILINE)
+    blocks: List[Tuple[int, int, str]] = []
+    for m in func_def_re.finditer(text):
+        # 関数本体 `{` の直後位置から対応する `}` を探す
+        i = m.end()
+        depth = 1
+        while i < len(text) and depth > 0:
+            if text[i] == '{':
+                depth += 1
+            elif text[i] == '}':
+                depth -= 1
+            i += 1
+        start_line = text[:m.start()].count("\n") + 1
+        end_line = text[:i].count("\n") + 1
+        blocks.append((start_line, end_line, m.group("params")))
+    return blocks
+
+
 def check_sizeof_pointer(fp, raw, cl, issues):
-    ptr_vars: Set[str] = set()
-    ptr_re = re.compile(r'\b\w+\s*\*\s*(\w+)\s*[;=]')
-    for line in cl:
-        for m in ptr_re.finditer(line):
-            ptr_vars.add(m.group(1))
-    sizeof_re = re.compile(r'\bsizeof\s*\(\s*(\w+)\s*\)')
+    """sizeof(x) で x がポインタサイズになるケースのみ flag する (CWE-467)。
+
+    関数スコープ単位で判定 (file-wide のポインタ名衝突を避ける)。
+
+    flag する:
+      - 関数パラメータの配列形 `void f(T name[N])` / 配列形 `T name[]` (decay)
+      - 関数パラメータのポインタ形 `void f(T *name)` (decay)
+      - ローカル/ファイルスコープの明示ポインタ宣言 (length context のとき)
+    flag しない:
+      - ローカル/ファイルスコープの配列宣言 `T name[N]`
+      - 構造体メンバ参照 `s.arr` / `s->arr`
+      - typedef 配列のローカル宣言
+
+    判定不能なら flag しない (high-precision over recall)。
+    """
+    # ファイルスコープ宣言の収集 (関数定義ブロック外の行)
+    func_blocks = _find_function_blocks(cl)
+    func_ranges = [(s, e) for s, e, _ in func_blocks]
+
+    def in_function(line_no: int) -> bool:
+        return any(s <= line_no <= e for s, e in func_ranges)
+
+    file_scope_ptrs: Set[str] = set()
+    file_scope_arrays: Set[str] = set()
+    file_ptr_re = re.compile(r'^\s*(?:static\s+|extern\s+|const\s+)*\w+\s*\*\s*(\w+)\s*[;=]')
+    file_arr_re = re.compile(r'^\s*(?:static\s+|extern\s+|const\s+|unsigned\s+|signed\s+)*\w+\s+(\w+)\s*\[')
     for i, line in enumerate(cl):
-        for m in sizeof_re.finditer(line):
-            var = m.group(1)
-            if var in ptr_vars:
-                if not re.search(rf'sizeof\s*\(\s*{re.escape(var)}\s*\)\s*/', line):
-                    issues.append(Issue(Severity.CRITICAL, fp, i + 1,
-                        f"sizeof({var})はポインタサイズ(4/8byte)を返す。配列長にならない"))
+        line_no = i + 1
+        if in_function(line_no):
+            continue
+        m = file_ptr_re.match(line)
+        if m:
+            file_scope_ptrs.add(m.group(1))
+            continue
+        m = file_arr_re.match(line)
+        if m:
+            file_scope_arrays.add(m.group(1))
+
+    sizeof_re = re.compile(r'\bsizeof\s*\(\s*(\w+)\s*\)')
+    inner_ptr_re = re.compile(r'^\s+(?:const\s+)?(?:unsigned\s+|signed\s+)?\w+\s*\*\s*(\w+)\s*[;=]')
+    inner_arr_re = re.compile(r'^\s+(?:const\s+|unsigned\s+|signed\s+|static\s+)*\w+\s+(\w+)\s*\[')
+
+    for s_line, e_line, params in func_blocks:
+        # パラメータから decay 変数を抽出
+        param_decay: Set[str] = set()
+        if params.strip() and params.strip() != "void":
+            for p in params.split(','):
+                p = p.strip()
+                if not p:
+                    continue
+                ap = re.search(r'\b(\w+)\s*\[[^\]]*\]\s*$', p)
+                pp = re.search(r'\*\s*(\w+)\s*$', p)
+                if ap:
+                    param_decay.add(ap.group(1))
+                elif pp:
+                    param_decay.add(pp.group(1))
+
+        # 関数本体のローカル宣言を抽出
+        local_ptrs: Set[str] = set()
+        local_arrays: Set[str] = set()
+        for ln in range(s_line, e_line + 1):
+            line = cl[ln - 1] if 0 < ln <= len(cl) else ""
+            mptr = inner_ptr_re.match(line)
+            if mptr:
+                local_ptrs.add(mptr.group(1))
+                continue
+            marr = inner_arr_re.match(line)
+            if marr:
+                local_arrays.add(marr.group(1))
+
+        # 関数本体内の sizeof を判定
+        for ln in range(s_line, e_line + 1):
+            line = cl[ln - 1] if 0 < ln <= len(cl) else ""
+            for m in sizeof_re.finditer(line):
+                var = m.group(1)
+                if var in param_decay:
+                    if not re.search(rf'sizeof\s*\(\s*{re.escape(var)}\s*\)\s*/', line):
+                        issues.append(Issue(Severity.CRITICAL, fp, ln,
+                            f"sizeof({var})は関数パラメータの decay でポインタサイズ(4/8byte)を返す。配列長は別引数で受け取れ"))
+                    continue
+                # ローカル変数優先 (shadowing)
+                if var in local_arrays:
+                    continue
+                if var in local_ptrs:
+                    if not re.search(rf'sizeof\s*\(\s*{re.escape(var)}\s*\)\s*/', line):
+                        issues.append(Issue(Severity.CRITICAL, fp, ln,
+                            f"sizeof({var})はポインタサイズ(4/8byte)を返す。配列長にならない"))
+                    continue
+                # ファイルスコープ
+                if var in file_scope_arrays:
+                    continue
+                if var in file_scope_ptrs:
+                    if not re.search(rf'sizeof\s*\(\s*{re.escape(var)}\s*\)\s*/', line):
+                        issues.append(Issue(Severity.CRITICAL, fp, ln,
+                            f"sizeof({var})はポインタサイズ(4/8byte)を返す。配列長にならない"))
 
 
 def check_fd_leak(fp, raw, cl, issues):
@@ -576,23 +741,80 @@ def check_fd_leak(fp, raw, cl, issues):
                 f"fopen結果{var}に対応するfcloseなし。ファイルディスクリプタリーク"))
 
 
+_INT_LITERAL_RE = re.compile(
+    r'(?<!\w)('
+    r'0[xX][0-9a-fA-F]+'      # hex
+    r'|0[bB][01]+'             # binary
+    r'|\d+'                    # decimal/octal
+    r')[uUlL]*(?!\w)'
+)
+
+
+def _magic_context(line: str, lit_start: int, lit_end: int) -> str:
+    """整数リテラルの context を ('buffer_size' / 'loop_bound' / 'bitmask' / 'general' / 'sizeof' / 'string') で返す。
+
+    'sizeof' / 'string' は flag しない context。
+    """
+    head = line[:lit_start]
+    tail = line[lit_end:]
+    # sizeof( N ) の中
+    if re.search(r'\bsizeof\s*\([^)]*$', head):
+        return "sizeof"
+    # malloc / calloc / realloc / memcpy / memset / memcmp / fread / fwrite / fgets / snprintf 引数
+    if re.search(r'\b(?:malloc|calloc|realloc|memcpy|memmove|memset|memcmp|fread|fwrite|fgets|snprintf|strncpy|strncat|strncmp)\s*\([^)]*$', head):
+        return "buffer_size"
+    # 配列宣言サイズ: `T name[N]` → head が `... name[` で終わる
+    if re.search(r'\b\w+\s*\[$', head) or re.search(r'^\s*[\w\s\*]+\[$', head):
+        return "buffer_size"
+    # for ループ上限: `for (...; X < N; ...)` のような形
+    if re.search(r'\bfor\s*\([^)]*[<>]=?\s*$', head):
+        return "loop_bound"
+    # bitmask / shift: `& 0xFF`, `>> 24`, `| 0x80`
+    if re.search(r'(?:&|\||\^|<<|>>)\s*$', head):
+        return "bitmask"
+    return "general"
+
+
 def check_magic_numbers(fp, raw, cl, issues, ignore):
+    """B3 統一ルール: 整数リテラル N が allowlist 以外なら全 flag、context で severity 切替。"""
     if ignore.magic_ok:
         return
-    magic_re = re.compile(r'(?<!\w)(\d{2,})(?!\w)')
-    brace_depth = 0
-    trivial = {"0", "1", "2", "10", "100", "1000", "00", "01"}
+    allowlist = ignore.magic_allowlist if ignore.magic_allowlist is not None else DEFAULT_MAGIC_ALLOWLIST
+    severity_for_context = {
+        "buffer_size": Severity.CRITICAL,
+        "loop_bound":  Severity.MAINT,
+        "bitmask":     Severity.MAINT,
+        "general":     Severity.MAINT,
+    }
     for i, line in enumerate(cl):
-        prev_depth = brace_depth
-        brace_depth += line.count('{') - line.count('}')
-        if prev_depth >= 1:
-            for m in magic_re.finditer(line):
-                val = m.group(1)
-                if val not in trivial:
-                    if not raw[i].strip().startswith("#"):
-                        issues.append(Issue(Severity.MAINT, fp, i + 1,
-                            f"マジックナンバー{val}。定数定義なしで意味不明・変更困難"))
-                        break
+        # 前処理ディレクティブ行は対象外
+        if raw[i].lstrip().startswith("#"):
+            continue
+        # 行内の重複報告を避ける (同じリテラルが何度出ても 1 件)
+        reported_in_line: Set[Tuple[str, int]] = set()
+        for m in _INT_LITERAL_RE.finditer(line):
+            lit_str = m.group(1)
+            val = _parse_int_literal(lit_str)
+            if val is None:
+                continue
+            if val in allowlist or -val in allowlist:
+                continue
+            ctx = _magic_context(line, m.start(), m.end())
+            if ctx in ("sizeof", "string"):
+                continue
+            sev = severity_for_context.get(ctx, Severity.MAINT)
+            key = (lit_str, m.start())
+            if key in reported_in_line:
+                continue
+            reported_in_line.add(key)
+            label = {
+                "buffer_size": "バッファサイズ",
+                "loop_bound":  "ループ上限",
+                "bitmask":     "ビットマスク",
+                "general":     "リテラル",
+            }[ctx]
+            issues.append(Issue(sev, fp, i + 1,
+                f"マジックナンバー{lit_str} ({label}) — allowlist 外。#define / enum / .creviewrc.json で命名 or 許可"))
 
 
 def check_volatile(fp, raw, cl, issues, ignore):
@@ -626,6 +848,233 @@ def check_volatile(fp, raw, cl, issues, ignore):
             elif re.search(rf'\b{re.escape(var)}\s*(?:[+\-*/%&|^]|<<|>>)=', line):
                 issues.append(Issue(Severity.DESIGN, fp, i + 1,
                     f"volatile変数{var}に複合代入使用。read-modify-writeは非アトミック、割り込み競合の危険"))
+
+
+# ─── attribute 契約 (Zenn コメントロールアウト 0.17.0) ─────────────────
+
+# 関数定義 / 宣言を抽出する共通正規表現。`type ... name(<params>) [__attribute__((..))] { or ;`
+# post グループは `{` または `;` の前までの文字列を全部拾う (ネストパレン対応のため `[^{;]*?` を使用)。
+_FUNC_HEAD_RE = re.compile(
+    r'^(?P<head>[^();{\n]{0,200}?)\b(?P<name>\w+)\s*\((?P<params>[^)]*)\)'
+    r'(?P<post>[^{;]*?)'
+    r'(?P<term>[{;])',
+    re.MULTILINE)
+
+
+def _iter_func_signatures(cl):
+    """C ファイルの関数定義/宣言を (head, name, params, attrs_text, term, line_no) で yield する。"""
+    text = "\n".join(cl)
+    for m in _FUNC_HEAD_RE.finditer(text):
+        line_no = text[:m.start()].count("\n") + 1
+        yield (m.group("head"), m.group("name"), m.group("params"),
+               m.group("post") or "", m.group("term"), line_no)
+
+
+def _has_attribute(post_text: str, name: str) -> bool:
+    """関数頭部の post 部分 (`__attribute__((..))` を含むかもしれない領域) で属性の有無を判定。"""
+    if not post_text or "__attribute__" not in post_text:
+        return False
+    return re.search(rf'\b{re.escape(name)}\b', post_text) is not None
+
+
+_WUR_PREFIXES = ("validate_", "check_", "init", "init_", "set_", "get_")
+
+
+def check_attr_nonnull(fp, raw, cl, issues):
+    """ATTR-NONNULL-001: ポインタ引数を NULL 検査せず unconditional dereference / 文字列扱いしているが
+    関数宣言に __attribute__((nonnull)) がないケースを flag する。
+
+    判定方針 (high-precision): 関数本体 (定義行から次の `}` まで) で、各ポインタ引数 p について
+      - `*p` / `p->` / `printf("%s", p)` / `strlen(p)` / `strcpy(..., p)` のいずれかが
+        unconditional に登場する (NULL 検査の `if` 内ではない)
+    かつ
+      - 関数頭部に nonnull 属性がない
+    なら flag。
+    """
+    text = "\n".join(cl)
+    for head, name, params, attrs, term, line_no in _iter_func_signatures(cl):
+        if term != '{':
+            continue  # 宣言だけならスキップ (定義の本体を見たい)
+        # 関数頭部 (head を含む 1 行前後) に既に nonnull が付いている場合の検出
+        # 別途宣言で nonnull を付けることも多いので、ファイル全体で同名関数の宣言/定義を探す
+        if _has_attribute(attrs, "nonnull"):
+            continue
+        # 別行に `void name(...) __attribute__((nonnull...))` が書かれているケース
+        forward_decl_re = re.compile(
+            rf'\b{re.escape(name)}\s*\([^)]*\)\s*'
+            r'(?:__attribute__\s*\(\([^)]*\bnonnull\b)')
+        if forward_decl_re.search(text):
+            continue
+        # ポインタ引数を抽出
+        ptr_args: List[str] = []
+        for p in params.split(','):
+            p = p.strip()
+            if not p or p == "void":
+                continue
+            mptr = re.search(r'\*\s*(\w+)\s*$', p)
+            if mptr:
+                ptr_args.append(mptr.group(1))
+        if not ptr_args:
+            continue
+        # 関数本体を行範囲で取得 (line_no から最寄りの } closing)
+        body_lines: List[str] = []
+        depth = 0
+        started = False
+        for i in range(line_no - 1, len(cl)):
+            line = cl[i]
+            depth += line.count('{') - line.count('}')
+            body_lines.append(line)
+            if not started and '{' in line:
+                started = True
+            if started and depth <= 0:
+                break
+        body = "\n".join(body_lines)
+        for arg in ptr_args:
+            # NULL 検査が本体内に存在すれば skip (シンプル判定: `if (arg == NULL)` or `if (!arg)`)
+            null_check = re.search(
+                rf'\bif\s*\(\s*(?:!\s*{re.escape(arg)}\b|{re.escape(arg)}\s*==\s*NULL\b|{re.escape(arg)}\s*==\s*0\b)',
+                body)
+            if null_check:
+                continue
+            # unconditional 使用 (printf/strlen/strcpy/strcat/memcpy/dereference)
+            uses = (
+                rf'(?:\bprintf\s*\([^)]*"%[a-zA-Z][^"]*"\s*,[^)]*\b{re.escape(arg)}\b)'
+                rf'|(?:\bstrlen\s*\(\s*{re.escape(arg)}\b)'
+                rf'|(?:\bstrcpy\s*\([^)]*\b{re.escape(arg)}\b)'
+                rf'|(?:\*\s*{re.escape(arg)}\b)'
+                rf'|(?:\b{re.escape(arg)}\s*->)'
+            )
+            if re.search(uses, body):
+                issues.append(Issue(Severity.CRITICAL, fp, line_no,
+                    f"ATTR-NONNULL-001: {name}() の {arg} を NULL 検査せず使用。"
+                    f"__attribute__((nonnull(N))) で契約を明示するか、関数先頭で NULL 検査して return"))
+                break  # 関数あたり 1 件で十分
+
+
+def check_attr_wur(fp, raw, cl, issues):
+    """ATTR-WUR-001: int / status_t 系を返す関数で、関数名 prefix が validate/check/init/set/get の
+    いずれかなのに __attribute__((warn_unused_result)) が付いていないケースを flag する。
+    """
+    text = "\n".join(cl)
+    for head, name, params, attrs, term, line_no in _iter_func_signatures(cl):
+        if term != '{':
+            continue  # 定義のみ対象 (宣言はファイル全体の forward 検査で代替)
+        # 戻り値型 (head の末尾) を取り出し: head には `int`, `status_t`, `int static`, etc.
+        head_norm = head.strip()
+        if not head_norm:
+            continue
+        # int / status_t / *_t を返す関数のみ対象
+        if not re.search(r'\b(int|status_t|\w+_t)\b', head_norm):
+            continue
+        # void / float / double を返す関数は対象外
+        if re.search(r'\b(void|float|double|char\s*\*?\s*$)\b', head_norm.split()[-1] if head_norm.split() else ""):
+            continue
+        if not name.startswith(_WUR_PREFIXES):
+            continue
+        if _has_attribute(attrs, "warn_unused_result"):
+            continue
+        # forward 宣言で warn_unused_result が付いている可能性
+        forward_decl_re = re.compile(
+            rf'\b{re.escape(name)}\s*\([^)]*\)\s*'
+            r'(?:__attribute__\s*\(\([^)]*\bwarn_unused_result\b)')
+        if forward_decl_re.search(text):
+            continue
+        issues.append(Issue(Severity.DESIGN, fp, line_no,
+            f"ATTR-WUR-001: {name}() に warn_unused_result 属性なし。"
+            f"呼び出し側が戻り値破棄しても検出できない (CWE-252 / MISRA C 2012 Dir 4.7)"))
+
+
+# ─── --check-prerequisites: ビルド設定スキャン (B4) ─────────────────
+
+_REQUIRED_FLAGS = ["-Wall", "-Wextra", "-Werror"]
+_RECOMMENDED_FLAGS = ["-fanalyzer", "-Wpedantic"]
+_BUILD_FILE_GLOBS = ("Makefile", "makefile", "GNUmakefile", "CMakeLists.txt", "*.cmake", "build.gradle")
+
+
+def _collect_build_files(target_dir: str) -> List[str]:
+    out: List[str] = []
+    for root, dirs, files in os.walk(target_dir):
+        # node_modules / .git 系は枝刈り
+        dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ("node_modules", "build", "out")]
+        for f in files:
+            for pat in _BUILD_FILE_GLOBS:
+                if fnmatch(f, pat):
+                    out.append(os.path.join(root, f))
+                    break
+    return out
+
+
+def scan_build_flags(target_dir: str) -> Tuple[List[str], List[str], List[str]]:
+    """ビルドファイルから -Wall / -Wextra / -Werror / -fanalyzer / -Wpedantic の有無を判定。
+
+    Returns:
+      (build_files, missing_required_flags, missing_recommended_flags)
+    """
+    files = _collect_build_files(target_dir)
+    if not files:
+        return ([], list(_REQUIRED_FLAGS), list(_RECOMMENDED_FLAGS))
+    text = ""
+    for f in files:
+        try:
+            with open(f, "r", encoding="utf-8", errors="replace") as fh:
+                text += fh.read() + "\n"
+        except OSError:
+            continue
+    missing_req = [f for f in _REQUIRED_FLAGS if f not in text]
+    missing_rec = [f for f in _RECOMMENDED_FLAGS if f not in text]
+    return (files, missing_req, missing_rec)
+
+
+def run_check_prerequisites(target_dir: str) -> int:
+    """`creview --check-prerequisites <dir>` のエントリ。stderr に診断、戻り値 0=OK / 1=警告あり。"""
+    files, missing_req, missing_rec = scan_build_flags(target_dir)
+    print(f"[creview] ビルド設定スキャン: {target_dir}", file=sys.stderr)
+    if not files:
+        print("  Makefile / CMakeLists.txt / *.cmake / build.gradle が見つかりませんでした。", file=sys.stderr)
+        return 1
+    print(f"  対象ビルドファイル: {len(files)} 件", file=sys.stderr)
+    for f in files[:5]:
+        print(f"    - {f}", file=sys.stderr)
+    if missing_req:
+        print(f"\n警告: コンパイラ警告レベルが弱いです (必須フラグ不足):", file=sys.stderr)
+        for flg in missing_req:
+            print(f"  - {flg}", file=sys.stderr)
+    if missing_rec:
+        print(f"\nヒント: 以下フラグの追加を推奨:", file=sys.stderr)
+        for flg in missing_rec:
+            print(f"  - {flg}", file=sys.stderr)
+    if missing_req or missing_rec:
+        print("\nL0 (コンパイラ警告) を先に通すことで、creview が報告する重大検出の", file=sys.stderr)
+        print("半分以上は事前に消えます。例:", file=sys.stderr)
+        print("  CFLAGS += -Wall -Wextra -Wpedantic -Werror -fanalyzer", file=sys.stderr)
+        print("\n--skip-prerequisites でこの診断を抑制できます。", file=sys.stderr)
+        return 1 if missing_req else 0
+    print("  L0 (コンパイラ警告) フラグは十分です。", file=sys.stderr)
+    return 0
+
+
+def check_null_callsite(fp, raw, cl, issues):
+    """NULL-CALLSITE-001: nonnull 宣言済みの関数に NULL リテラルを渡す callsite を flag する。"""
+    text = "\n".join(cl)
+    # nonnull 属性付き関数名を収集
+    nonnull_funcs: Set[str] = set()
+    for head, name, params, attrs, term, line_no in _iter_func_signatures(cl):
+        if _has_attribute(attrs, "nonnull"):
+            nonnull_funcs.add(name)
+    if not nonnull_funcs:
+        return
+    # callsite 検出: NULL を直接渡している
+    for i, line in enumerate(cl):
+        for fname in nonnull_funcs:
+            call_re = re.compile(rf'\b{re.escape(fname)}\s*\(([^)]*)\)')
+            for m in call_re.finditer(line):
+                args = m.group(1)
+                arg_list = [a.strip() for a in args.split(',')]
+                for arg in arg_list:
+                    if arg == "NULL" or arg == "0" or arg == "(void *)0":
+                        issues.append(Issue(Severity.CRITICAL, fp, i + 1,
+                            f"NULL-CALLSITE-001: nonnull 宣言済み {fname}() に NULL を渡している (CWE-476)"))
+                        break
 
 
 def check_format_string(fp, raw, cl, issues):
@@ -2122,6 +2571,9 @@ def run_local_analysis(filepath: str, ignore: IgnoreConfig,
         ("volatile",            lambda: check_volatile(filepath, raw, cl, issues, ignore)),
         ("packed",              lambda: check_packed(filepath, raw, cl, issues, ignore)),
         ("format_string",       lambda: check_format_string(filepath, raw, cl, issues)),
+        ("attr_nonnull",        lambda: check_attr_nonnull(filepath, raw, cl, issues)),
+        ("attr_wur",            lambda: check_attr_wur(filepath, raw, cl, issues)),
+        ("null_callsite",       lambda: check_null_callsite(filepath, raw, cl, issues)),
         ("use_after_free",      lambda: check_use_after_free(filepath, raw, cl, issues)),
         ("uninitialized",       lambda: check_uninitialized(filepath, raw, cl, issues)),
         ("sign_compare",        lambda: check_sign_compare(filepath, raw, cl, issues)),
@@ -2389,6 +2841,9 @@ RULE_DESCRIPTIONS = {
     "volatile":            "volatile変数の非アトミック操作",
     "packed":              "packed構造体のアラインメント問題",
     "format_string":       "フォーマット文字列脆弱性",
+    "attr_nonnull":        "ATTR-NONNULL-001: ポインタ引数の unconditional dereference + nonnull 属性なし",
+    "attr_wur":            "ATTR-WUR-001: validate/check/init/set/get 系関数 + warn_unused_result 属性なし",
+    "null_callsite":       "NULL-CALLSITE-001: nonnull 宣言済み関数に NULL を渡す callsite",
     "use_after_free":      "use-after-free",
     "uninitialized":       "未初期化変数使用",
     "sign_compare":        "signed/unsigned混合比較",
@@ -3444,6 +3899,15 @@ def main():
                         help="プリセットグループ (memory/security/concurrency/style/pr/strict)")
     parser.add_argument("--ask",
                         help="自然言語でチェック内容を指示 (API使用)")
+    parser.add_argument("--check-prerequisites", action="store_true",
+                        help="対象ディレクトリのビルド設定 (Makefile / CMakeLists.txt 等) を"
+                             "スキャンし、-Wall/-Wextra/-Werror/-fanalyzer/-Wpedantic の有無を"
+                             "確認して終了 (B4)")
+    parser.add_argument("--skip-prerequisites", action="store_true",
+                        help="デフォルト実行時のビルド設定軽量チェックを抑制")
+    parser.add_argument("--magic-allowlist",
+                        help="マジックナンバー allowlist をカンマ区切りで指定 "
+                             "(例: 8,16,32,64,0xFF)。.creviewrc.json より優先")
     parser.add_argument("--list-rules", action="store_true",
                         help="利用可能な全ルール名を表示して終了")
     parser.add_argument("--list-presets", action="store_true",
@@ -3451,6 +3915,17 @@ def main():
     parser.add_argument("--version", action="version",
                         version=f"creview {VERSION}")
     args = parser.parse_args()
+
+    # --check-prerequisites: ビルド設定スキャンして終了
+    if args.check_prerequisites:
+        if not args.targets:
+            parser.error("対象ディレクトリを指定してください (例: creview --check-prerequisites .)")
+        rc = 0
+        for tgt in args.targets:
+            target_dir = tgt if os.path.isdir(tgt) else os.path.dirname(os.path.abspath(tgt)) or "."
+            if run_check_prerequisites(target_dir) != 0:
+                rc = 1
+        sys.exit(rc)
 
     # --list-rules: ルール一覧表示して終了
     if args.list_rules:
@@ -3534,8 +4009,31 @@ def main():
             print(f"ベースライン読み込み失敗: {e}", file=sys.stderr)
             baseline_issues = []
 
+    # --magic-allowlist CLI が指定されていれば parse して使う
+    cli_magic_allowlist: Optional[Set[int]] = None
+    if args.magic_allowlist:
+        cli_magic_allowlist = set()
+        for tok in args.magic_allowlist.split(','):
+            v = _parse_int_literal(tok)
+            if v is not None:
+                cli_magic_allowlist.add(v)
+
+    # デフォルト実行時の軽量 prerequisites チェック (--skip-prerequisites で抑制)
+    if not args.skip_prerequisites and not args.local_only and files:
+        first_dir = os.path.dirname(os.path.abspath(files[0])) or "."
+        try:
+            _, _missing_req, _ = scan_build_flags(first_dir)
+            if _missing_req:
+                print(f"[creview] L0 ヒント: ビルド設定に {', '.join(_missing_req)} が見当たりません。"
+                      f"`creview --check-prerequisites <dir>` で詳細を確認できます。"
+                      f" (--skip-prerequisites で抑制)", file=sys.stderr)
+        except Exception:
+            pass  # スキャン失敗は無視
+
     for fpath in files:
         ignore = find_ignore(fpath)
+        if cli_magic_allowlist is not None:
+            ignore.magic_allowlist = cli_magic_allowlist
 
         # EXCLUDE判定
         if is_excluded(fpath, ignore):
