@@ -7,6 +7,20 @@ C言語のコードや仕様書から**事故の原因になる箇所だけを�
 コード生成しません。修正提案しません。最適化しません。
 やることは1つだけ。**危険箇所の指摘。**
 
+## 4 層モデルでの位置づけ
+
+creview は **L0 (コンパイラ警告) / L1 (clang-tidy / cppcheck) の代替ではない**。先に L0 / L1 を通してから使う「後段の高次パターン検出」レイヤー。
+
+| 層 | ツール | 役割 |
+|---|---|---|
+| **L0 ビルド時** | `gcc / clang` の警告 + `-Werror` | `-Wall -Wextra -Wpedantic -Werror -fanalyzer` (GCC) / `-Weverything -Werror` (Clang)。**警告ゼロにならない PR はそもそもレビューに入らない**ルール化 |
+| **L1 PR チェック** | clang-tidy / cppcheck | OSS 主流の静的解析を CI に組み込む |
+| **L2 PR レビュー** | **creview** ← ココ | プロジェクト固有パターン / 日本語ナレッジ / severity モデル (重大/設計不明/保守危険) / CWE/MISRA マッピング / `--preset pr` で diff のみ走査 / AI 補強 |
+| **L2' 自己チェック** | c-review-ai (ブラウザ版) | 環境構築不要で試せる軽量版 |
+| **L3 監査** | CSAF | libclang AST + 依存グラフで risk A/B/C 自動昇格 |
+
+L0 の警告がゼロにならない PR を creview で叩いても、消せた警告まで人間が読むことになって意味がない。creview を走らせる前に `creview --check-prerequisites <dir>` で L0 のフラグ整備を確認してください。
+
 ## 検出する内容
 
 | 分類 | 内容 |
