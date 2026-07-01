@@ -26,13 +26,12 @@ CONFIGFILE = "config.txt"
 MAX_CHUNK_BYTES = 80_000
 MAX_CHUNK_LINES = 800   # config.txtで変更可
 DEFAULT_TIMEOUT = 60
-DEFAULT_MODEL = "claude-sonnet-4-20250514"
+DEFAULT_MODEL = "claude-sonnet-5"
 # モデル廃止時のフォールバックチェーン
 # config.txt指定 → DEFAULT → フォールバック順に試行
 MODEL_FALLBACKS = [
-    "claude-sonnet-4-20250514",
-    "claude-sonnet-4-5-20250929",
-    "claude-sonnet-4-20250514",
+    "claude-sonnet-5",
+    "claude-sonnet-4-6",
 ]
 DEBUG = False
 
@@ -2706,6 +2705,9 @@ def _call_claude_api_single(system_prompt: str, user_content: str,
     body = json.dumps({
         "model": model,
         "max_tokens": 4096,
+        # Sonnet 5 は thinking 省略で adaptive 思考が ON になり max_tokens=4096 を圧迫
+        # しうる。旧 Sonnet4 系と挙動を揃えるため明示 disabled にする。
+        "thinking": {"type": "disabled"},
         "system": system_prompt,
         "messages": [
             {"role": "user", "content": user_content}
